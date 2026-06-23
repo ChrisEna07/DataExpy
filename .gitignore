@@ -1,0 +1,37 @@
+# Credenciales y configuración local
+.env
+*.key
+*.pem
+
+# Python — bytecode, cachés, entornos virtuales
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyzw
+.venv/
+venv/
+.python-version
+*.egg-info/
+*.egg
+
+# PyInstaller — artefactos de compilación
+dist/
+build/
+*.spec
+*.manifest
+
+# Logs
+*.log
+
+# Sistema operativo
+Thumbs.db
+.DS_Store
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# IDE / editor
+.vscode/
+.idea/
+*.sublime-*
