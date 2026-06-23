@@ -3,14 +3,24 @@ import re
 import json
 import logging
 import time
+import socket
+import platform
+import getpass
 from dataclasses import dataclass, field
 from typing import Optional
+from datetime import datetime
 
 import base64
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from supabase import create_client, Client
+from llm_client import (
+    obtener_respuesta_llm,
+    obtener_respuesta_vision,
+    CIRCUIT_BREAKER_TEXTO,
+    CIRCUIT_BREAKER_VISION,
+    CircuitBreakerOpen,
+)
 
 load_dotenv()
 
@@ -55,6 +65,60 @@ class Settings:
                 f"Faltan variables de entorno: {', '.join(missing)}. "
                 "Revisa tu archivo .env"
             )
+
+
+# ---------------------------------------------------------------------------
+# Auditoría
+# ---------------------------------------------------------------------------
+
+AUDIT_USER = getpass.getuser() or os.getenv("USERNAME", "unknown")
+AUDIT_HOST = socket.gethostname()
+AUDIT_PROCESADO_POR = f"{AUDIT_USER}@{AUDIT_HOST}"
+
+# Handler de archivo para auditoría estructurada
+_AUDIT_LOG_PATH = None
+_audit_logger = logging.getLogger("auditoria")
+_audit_logger.setLevel(logging.INFO)
+_audit_logger.propagate = False
+
+
+def _init_audit_log() -> None:
+    global _AUDIT_LOG_PATH
+    if _audit_logger.handlers:
+        return
+    from pathlib import Path
+    _AUDIT_LOG_PATH = Path(__file__).resolve().parent / "auditoria.log"
+    handler = logging.FileHandler(str(_AUDIT_LOG_PATH), encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | Usuario: %(user)s | Accion: %(message)s"
+    ))
+    _audit_logger.addHandler(handler)
+
+
+def registrar_accion(accion: str, estado: str = "EXITO", **extra) -> None:
+    _init_audit_log()
+    identidad = f"{AUDIT_USER}@{AUDIT_HOST}"
+    extra_str = f" | {json.dumps(extra, ensure_ascii=False)}" if extra else ""
+    _audit_logger.info(
+        "%s - Estado: %s%s",
+        accion, estado, extra_str,
+        extra={"user": identidad},
+    )
+
+
+def _enriquecer_audit(datos: dict, status: str = "COMPLETADO") -> dict:
+    datos["procesado_por"] = AUDIT_PROCESADO_POR
+    datos["status"] = status
+    datos["procesado_en"] = datetime.now().isoformat()
+    datos["log_detalles"] = {
+        "usuario": AUDIT_USER,
+        "host": AUDIT_HOST,
+        "identidad": AUDIT_PROCESADO_POR,
+        "accion": "PROCESAR_DOCUMENTO",
+        "estado": status,
+    }
+    return datos
 
 
 # ---------------------------------------------------------------------------
@@ -124,17 +188,15 @@ EXPECTED_FIELDS = {"cliente", "fecha", "total", "id_documento"}
 # ---------------------------------------------------------------------------
 
 _settings: Optional[Settings] = None
-_ai_client: Optional[OpenAI] = None
 _db_client: Optional[Client] = None
 
 
 def _init() -> None:
-    global _settings, _ai_client, _db_client
+    global _settings, _db_client
     if _settings is not None:
         return
     _settings = Settings()
     _settings.validate()
-    _ai_client = OpenAI(api_key=_settings.groq_api_key, base_url="https://api.groq.com/openai/v1")
     _db_client = create_client(_settings.supabase_url, _settings.supabase_key)
     log.info("Clientes inicializados correctamente")
 
@@ -146,26 +208,33 @@ def _init() -> None:
 def extraer(texto: str) -> dict:
     _init()
     last_error = None
+    es_largo = len(texto) > 50000
 
     for attempt in range(1, _settings.max_retries + 1):
         try:
             log.info("Extracción — intento %d/%d", attempt, _settings.max_retries)
-            response = _ai_client.chat.completions.create(
-                model=_settings.groq_model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": texto},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            raw = response.choices[0].message.content
+
+            def _call():
+                return obtener_respuesta_llm(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=texto,
+                    es_largo=es_largo,
+                    response_format={"type": "json_object"},
+                    temperatura=0.0,
+                )
+
+            raw = CIRCUIT_BREAKER_TEXTO.call(_call)
             datos = json.loads(raw)
             _validar_esquema(datos)
             _normalizar(datos)
             log.info("Extracción exitosa: %s", datos)
             return datos
 
+        except CircuitBreakerOpen as e:
+            log.warning("Circuit Breaker abierto (intento %d): %s", attempt, e)
+            last_error = e
+            if attempt < _settings.max_retries:
+                time.sleep(_settings.retry_delay * attempt * 2)
         except json.JSONDecodeError as e:
             log.warning("JSON inválido (intento %d): %s", attempt, e)
             last_error = e
@@ -214,13 +283,16 @@ def _normalizar(datos: dict) -> None:
 # Persistencia en Supabase
 # ---------------------------------------------------------------------------
 
-def guardar(datos: dict) -> dict:
+def guardar(datos: dict, status: str = "COMPLETADO") -> dict:
     _init()
+    datos = _enriquecer_audit(datos, status)
     try:
         resultado = _db_client.table("documentos_legales").insert(datos).execute()
-        log.info("Insertado en Supabase: %s", datos.get("id_documento"))
+        log.info("Insertado en Supabase: %s | status: %s", datos.get("id_documento"), status)
+        registrar_accion("PROCESAR_DOCUMENTO", estado=status, id_documento=datos.get("id_documento"))
         return resultado.data[0] if resultado.data else datos
     except Exception as e:
+        registrar_accion("PROCESAR_DOCUMENTO", estado="FALLO", error=str(e))
         log.error("Error al insertar en Supabase: %s", e)
         raise
 
@@ -231,7 +303,7 @@ def guardar(datos: dict) -> dict:
 
 def procesar_documento(texto: str) -> dict:
     datos = extraer(texto)
-    guardar(datos)
+    guardar(datos, status="COMPLETADO")
     return datos
 
 
@@ -242,42 +314,34 @@ def procesar_documento(texto: str) -> dict:
 def extraer_imagen(base64_image: str, mime_type: str = "image/jpeg") -> dict:
     _init()
     last_error = None
-    model = _settings.groq_vision_model
+    import base64
+    image_bytes = base64.b64decode(base64_image)
 
     for attempt in range(1, _settings.max_retries + 1):
         try:
-            log.info("Extracción visión — intento %d/%d (%s)", attempt, _settings.max_retries, model)
-            response = _ai_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Extrae los datos de la imagen en formato JSON.",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{base64_image}"
-                                },
-                            },
-                        ],
-                    },
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-                max_tokens=1024,
-            )
-            raw = response.choices[0].message.content
+            log.info("Extracción visión — intento %d/%d", attempt, _settings.max_retries)
+
+            def _call():
+                return obtener_respuesta_vision(
+                    image_bytes=image_bytes,
+                    mime_type=mime_type,
+                    system_prompt=VISION_SYSTEM_PROMPT,
+                    text_prompt="Extrae los datos de la imagen en formato JSON.",
+                    max_tokens=1024,
+                )
+
+            raw = CIRCUIT_BREAKER_VISION.call(_call)
             datos = json.loads(raw)
             _validar_esquema(datos)
             _normalizar(datos)
             log.info("Extracción visión exitosa: %s", datos)
             return datos
 
+        except CircuitBreakerOpen as e:
+            log.warning("Circuit Breaker visión abierto (intento %d): %s", attempt, e)
+            last_error = e
+            if attempt < _settings.max_retries:
+                time.sleep(_settings.retry_delay * attempt * 2)
         except json.JSONDecodeError as e:
             log.warning("JSON inválido (intento %d): %s", attempt, e)
             last_error = e
@@ -301,7 +365,7 @@ def extraer_imagen(base64_image: str, mime_type: str = "image/jpeg") -> dict:
 def procesar_imagen(file_bytes: bytes, mime_type: str) -> dict:
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     datos = extraer_imagen(b64, mime_type)
-    guardar(datos)
+    guardar(datos, status="COMPLETADO")
     return datos
 
 
@@ -311,42 +375,32 @@ def procesar_imagen(file_bytes: bytes, mime_type: str) -> dict:
 
 def transcribir_imagen(file_bytes: bytes, mime_type: str) -> str:
     _init()
-    b64 = base64.b64encode(file_bytes).decode("utf-8")
-    model = _settings.groq_vision_model
     last_error = None
 
     for attempt in range(1, _settings.max_retries + 1):
         try:
-            log.info("Transcripción — intento %d/%d (%s)", attempt, _settings.max_retries, model)
-            response = _ai_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": TRANSCRIBE_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Transcribe todo el texto del documento.",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{b64}"
-                                },
-                            },
-                        ],
-                    },
-                ],
-                temperature=0.0,
-                max_tokens=4096,
-            )
-            texto = response.choices[0].message.content.strip()
+            log.info("Transcripción — intento %d/%d", attempt, _settings.max_retries)
+
+            def _call():
+                return obtener_respuesta_vision(
+                    image_bytes=file_bytes,
+                    mime_type=mime_type,
+                    system_prompt=TRANSCRIBE_PROMPT,
+                    text_prompt="Transcribe todo el texto del documento.",
+                    max_tokens=4096,
+                )
+
+            texto = CIRCUIT_BREAKER_VISION.call(_call).strip()
             if not texto:
                 raise ValueError("Transcripción vacía")
             log.info("Transcripción exitosa (%d caracteres)", len(texto))
             return texto
 
+        except CircuitBreakerOpen as e:
+            log.warning("Circuit Breaker transcripción abierto (intento %d): %s", attempt, e)
+            last_error = e
+            if attempt < _settings.max_retries:
+                time.sleep(_settings.retry_delay * attempt * 2)
         except Exception as e:
             log.warning("Transcripción fallida (intento %d): %s", attempt, e)
             last_error = e
@@ -374,19 +428,25 @@ def extraer_campos_dinamico(texto: str, campos: list[str]) -> dict:
     for attempt in range(1, _settings.max_retries + 1):
         try:
             log.info("Extracción dinámica — intento %d/%d: %s", attempt, _settings.max_retries, campos)
-            response = _ai_client.chat.completions.create(
-                model=_settings.groq_model,
-                messages=[
-                    {"role": "system", "content": "Eres un extractor de datos. Responde solo con JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.0,
-            )
-            datos = json.loads(response.choices[0].message.content)
+
+            def _call():
+                return obtener_respuesta_llm(
+                    system_prompt="Eres un extractor de datos. Responde solo con JSON.",
+                    user_prompt=prompt,
+                    response_format={"type": "json_object"},
+                    temperatura=0.0,
+                )
+
+            raw = CIRCUIT_BREAKER_TEXTO.call(_call)
+            datos = json.loads(raw)
             log.info("Extracción dinámica exitosa: %s", datos)
             return datos
 
+        except CircuitBreakerOpen as e:
+            log.warning("Circuit Breaker abierto (intento %d): %s", attempt, e)
+            last_error = e
+            if attempt < _settings.max_retries:
+                time.sleep(_settings.retry_delay * attempt * 2)
         except Exception as e:
             log.warning("Extracción dinámica fallida (intento %d): %s", attempt, e)
             last_error = e
@@ -430,8 +490,247 @@ def procesar_con_transcripcion(file_bytes: bytes, mime_type: str) -> dict:
     transcripcion = transcribir_imagen(file_bytes, mime_type)
     datos = extraer(transcripcion)
     datos["transcripcion_completa"] = transcripcion
-    guardar(datos)
+    guardar(datos, status="COMPLETADO")
     return datos
+
+
+# ---------------------------------------------------------------------------
+# Reporte PDF de conformidad
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Reporte PDF de conformidad (versión profesional)
+# ---------------------------------------------------------------------------
+
+_logo_cache = None
+
+
+def _get_logo_path() -> str | None:
+    """Devuelve la ruta al logo del proyecto, o None si no existe."""
+    from pathlib import Path
+    for p in [
+        Path(__file__).resolve().parent / "assets" / "logo.png",
+        Path(__file__).resolve().parent / "logo.png",
+    ]:
+        if p.exists():
+            return str(p)
+    return None
+
+
+def _generar_logo_svg() -> str:
+    """Genera un logo vectorial simple (escudo) incrustado en el PDF."""
+    return None  # placeholder - usaremos shapes directos
+
+
+def _dibujar_logo(pdf, x: float, y: float, size: float = 12):
+    """Dibuja un escudo simple como logo directamente en el PDF."""
+    pdf.set_fill_color(15, 40, 96)
+    pdf.set_draw_color(15, 40, 96)
+    # Escudo
+    cx, cy = x + size / 2, y + 2
+    r = size / 2
+    # Círculo superior
+    pdf.circle(cx, cy, r)
+    pdf.set_fill_color(255, 255, 255)
+    # Letra D
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", int(size * 0.45))
+    pdf.text(cx - size * 0.13, cy + size * 0.18, "D")
+
+
+def _hash_datos(datos: dict) -> str:
+    """SHA-256 del JSON de datos para el QR de validación."""
+    import hashlib
+    limpio = {k: v for k, v in datos.items() if k not in ("transcripcion_completa", "_timestamp")}
+    raw = json.dumps(limpio, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _sanear_texto(texto: str) -> str:
+    reemplazos = {
+        "\u2014": "-", "\u2013": "-",
+        "\u2018": "'", "\u2019": "'",
+        "\u201c": '"', "\u201d": '"',
+        "\u2026": "...", "\u00a0": " ",
+        "\u00bf": "?", "\u00a1": "!",
+    }
+    for old, new in reemplazos.items():
+        texto = texto.replace(old, new)
+    return texto
+
+
+def generar_reporte_pdf(datos: dict, output_path: str) -> str:
+    from fpdf import FPDF
+    from pathlib import Path
+
+    FONT_DIR = Path(__file__).resolve().parent / "fonts"
+    FONT_PATH = FONT_DIR / "arial.ttf"
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=18)
+
+    # Fuente
+    FONT_NAME = "Helvetica"
+    if FONT_PATH.exists():
+        pdf.add_font("UniFont", "", str(FONT_PATH), uni=True)
+        pdf.add_font("UniFont", "B", str(FONT_PATH), uni=True)
+        FONT_NAME = "UniFont"
+
+    def w(texto: str) -> str:
+        return _sanear_texto(str(texto)) if FONT_NAME == "Helvetica" else str(texto)
+
+    # -----------------------------------------------------------------------
+    # Header con logo y título
+    # -----------------------------------------------------------------------
+    logo_path = _get_logo_path()
+    if logo_path:
+        pdf.image(logo_path, x=160, y=10, w=30)
+    else:
+        # Logo dibujado
+        pdf.set_fill_color(15, 40, 96)
+        pdf.set_draw_color(15, 40, 96)
+        cx, cy = 172, 18
+        pdf.circle(cx, cy, 10)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.text(cx - 3, cy + 3.5, "D")
+
+    pdf.set_font(FONT_NAME, "B", 18)
+    pdf.set_text_color(15, 40, 96)
+    pdf.cell(0, 10, w("DataExPY by ChrizDev"), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font(FONT_NAME, "", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 5, w("Reporte de conformidad — Extraccion de documentos legales"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    # Línea separadora
+    pdf.set_draw_color(15, 40, 96)
+    pdf.set_line_width(0.6)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(5)
+
+    # -----------------------------------------------------------------------
+    # Tabla: Identificación
+    # -----------------------------------------------------------------------
+    placeholder = "-"
+
+    def _fila_tabla(label: str, value: str, bold_label: bool = True):
+        label = w(label)
+        value = w(str(value))
+        pdf.set_fill_color(245, 245, 250)
+        pdf.set_draw_color(210, 210, 220)
+        x0 = 20
+        col1_w = 55
+        col2_w = 125
+        h = 7
+        y = pdf.get_y()
+
+        # Fondo
+        pdf.rect(x0, y, col1_w + col2_w, h, style="F")
+        # Borde izquierdo (azul)
+        pdf.set_fill_color(15, 40, 96)
+        pdf.rect(x0, y, 2, h, style="F")
+
+        pdf.set_text_color(60, 60, 60)
+        if bold_label:
+            pdf.set_font(FONT_NAME, "B", 9)
+        else:
+            pdf.set_font(FONT_NAME, "", 9)
+        pdf.set_xy(x0 + 5, y + 1.2)
+        pdf.cell(col1_w - 5, h - 2, label)
+
+        pdf.set_font(FONT_NAME, "", 9)
+        pdf.set_text_color(15, 40, 96)
+        pdf.set_xy(x0 + col1_w + 3, y + 1.2)
+        pdf.cell(col2_w - 3, h - 2, value)
+
+        pdf.set_y(y + h)
+
+    pdf.set_font(FONT_NAME, "B", 10)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 7, w("Identificacion"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+    _fila_tabla("ID Documento", datos.get("id_documento") or placeholder)
+    _fila_tabla("Cliente", datos.get("cliente") or placeholder)
+    pdf.ln(3)
+
+    # -----------------------------------------------------------------------
+    # Tabla: Datos Contables
+    # -----------------------------------------------------------------------
+    pdf.set_font(FONT_NAME, "B", 10)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 7, w("Datos contables"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+    _fila_tabla("Fecha del documento", datos.get("fecha") or placeholder)
+    total_str = f"${datos['total']:,.2f}" if datos.get("total") is not None else placeholder
+    _fila_tabla("Total", total_str)
+    pdf.ln(3)
+
+    # -----------------------------------------------------------------------
+    # Tabla: Auditoría
+    # -----------------------------------------------------------------------
+    pdf.set_font(FONT_NAME, "B", 10)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 7, w("Auditoria"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+    _fila_tabla("Fecha de procesamiento", datos.get("procesado_en", datetime.now().isoformat())[:19])
+    _fila_tabla("Procesado por", datos.get("procesado_por", AUDIT_PROCESADO_POR))
+    status_val = datos.get("status", "COMPLETADO")
+    status_icon = "COMPLETADO" if status_val == "COMPLETADO" else status_val
+    _fila_tabla("Estado", status_icon)
+    pdf.ln(6)
+
+    # -----------------------------------------------------------------------
+    # QR de validación
+    # -----------------------------------------------------------------------
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    hash_val = _hash_datos(datos)
+    qr_data = f"DATEXPY:{hash_val}"
+
+    try:
+        import qrcode
+        from io import BytesIO
+        qr_img = qrcode.make(qr_data, box_size=2, border=1)
+        qr_bytes = BytesIO()
+        qr_img.save(qr_bytes, format="PNG")
+        qr_bytes.seek(0)
+        # Generar nombre temporal
+        tmp_qr = Path(output_path).parent / f"_qr_{Path(output_path).stem}.png"
+        with open(tmp_qr, "wb") as f:
+            f.write(qr_bytes.getvalue())
+        pdf.image(str(tmp_qr), x=160, y=pdf.get_y() - 2, w=22)
+        tmp_qr.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # Texto del hash al lado del QR
+    pdf.set_font(FONT_NAME, "", 7)
+    pdf.set_text_color(100, 100, 100)
+    pdf.set_xy(20, pdf.get_y() + 1)
+    pdf.cell(130, 4, w(f"Hash de validacion: {hash_val}"))
+    pdf.set_xy(20, pdf.get_y() + 4)
+    pdf.cell(130, 4, w("Escanee el QR para verificar la integridad del documento."))
+    pdf.ln(10)
+
+    # -----------------------------------------------------------------------
+    # Footer (se repite en cada página automáticamente)
+    # -----------------------------------------------------------------------
+    pdf.alias_nb_pages()
+    pdf.set_y(-15)
+    pdf.set_font(FONT_NAME, "", 7)
+    pdf.set_text_color(140, 140, 140)
+    pdf.cell(0, 4, w(f"Generado: {datetime.now():%Y-%m-%d %H:%M}  |  Pagina {pdf.page_no()}/{{nb}}  |  DataExPY by ChrizDev"), align="C")
+
+    pdf.output(output_path)
+    log.info("Reporte PDF generado: %s", output_path)
+    return output_path
 
 
 # ---------------------------------------------------------------------------

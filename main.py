@@ -4,6 +4,7 @@ import io
 import csv
 import sys
 import threading
+import queue
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -21,6 +22,9 @@ from extractor import (
     transcribir_imagen,
     extraer_campos_dinamico,
     buscar_en_texto,
+    generar_reporte_pdf,
+    AUDIT_PROCESADO_POR,
+    registrar_accion,
     Settings,
 )
 
@@ -55,6 +59,38 @@ def extraer_texto_pdf(path: str) -> str:
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 
+def _pdf_a_jpeg_bytes(path: str, dpi: int = 200) -> list[tuple[bytes, str]]:
+    """Convierte cada página de un PDF a JPEG bytes con MIME image/jpeg."""
+    import fitz
+    pages = []
+    doc = fitz.open(path)
+    for i in range(len(doc)):
+        pix = doc[i].get_pixmap(dpi=dpi)
+        img_bytes = pix.tobytes("jpeg")
+        pages.append((img_bytes, "image/jpeg"))
+    doc.close()
+    return pages
+
+
+def _ocr_pdf(path: str) -> str:
+    """Procesa un PDF escaneado (sin texto) con OCR vía Groq Visión.
+    Limita a las primeras 3 páginas para evitar rate limiting (429)."""
+    import time as _time
+    paginas = _pdf_a_jpeg_bytes(path)
+    MAX_PAGINAS = min(len(paginas), 3)
+    textos = []
+    for i in range(MAX_PAGINAS):
+        img_bytes, mime = paginas[i]
+        texto = transcribir_imagen(img_bytes, mime)
+        textos.append(texto)
+        if i < MAX_PAGINAS - 1:
+            _time.sleep(2)  # pausa entre páginas para respetar rate limit
+    if len(paginas) > MAX_PAGINAS:
+        textos.append(f"[{len(paginas) - MAX_PAGINAS} páginas restantes omitidas. "
+                       "Usa 'Ver transcripción' si necesitas el documento completo.]")
+    return "\n\n".join(textos)
+
+
 def extraer_texto_docx(path: str) -> str:
     doc = Document(path)
     return "\n".join(p.text for p in doc.paragraphs)
@@ -63,7 +99,11 @@ def extraer_texto_docx(path: str) -> str:
 def leer_archivo(path: str) -> str:
     ext = Path(path).suffix.lower()
     if ext == ".pdf":
-        return extraer_texto_pdf(path)
+        texto = extraer_texto_pdf(path)
+        if not texto or len(texto.strip()) < 10:
+            # PDF escaneado (sin texto) → degradación elegante a OCR
+            return _ocr_pdf(path)
+        return texto
     elif ext == ".docx":
         return extraer_texto_docx(path)
     elif ext == ".txt":
@@ -161,8 +201,39 @@ class StatusBar(ctk.CTkFrame):
         self.label.pack(side="left", padx=15)
 
     def set(self, texto: str, ok: bool = True):
-        prefix = "✅" if ok else "❌"
+        prefix = "🟢" if ok else "🔴"
         self.label.configure(text=f"{prefix} {texto}")
+
+
+# ---------------------------------------------------------------------------
+# Toast notifications (auto-dismiss)
+# ---------------------------------------------------------------------------
+
+class Toast(ctk.CTkFrame):
+    """Notificación tipo toast animada, posicionada en la esquina superior derecha."""
+    def __init__(self, master, mensaje: str, tipo: str = "success", duracion: int = 3000):
+        colores = {"success": "#22c55e", "error": "#ef4444", "info": "#3b82f6"}
+        iconos = {"success": "✔", "error": "✘", "info": "ℹ"}
+        bg = colores.get(tipo, "#22c55e")
+        icon = iconos.get(tipo, "✔")
+        super().__init__(master, fg_color=bg, corner_radius=10)
+
+        self.label = ctk.CTkLabel(
+            self, text=f" {icon}  {mensaje}",
+            font=("Segoe UI", 12), text_color="white",
+            padx=16, pady=8,
+        )
+        self.label.pack()
+
+        self.place(relx=0.98, rely=0.04, anchor="ne")
+        self.lift()
+        self.after(duracion, self._fade_out)
+
+    def _fade_out(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +256,10 @@ class BusquedaModal(ctk.CTkToplevel):
         self.texto = texto_documento
         self.on_extraer_campo = on_extraer_campo
         self._resultados_actuales: list[dict] = []
+
+        self.transient(master)
+        self.grab_set()
+        self.focus_set()
 
         self.title("🔍 Buscar en documento")
         self.geometry("750x580")
@@ -365,6 +440,10 @@ class DataExPYApp(ctk.CTk):
         self.imagen_bytes: bytes | None = None
         self.imagen_mime: str | None = None
 
+        # Cola asíncrona para comunicación hilo→UI
+        self.task_queue: queue.Queue = queue.Queue()
+        self.after(100, self._check_queue)
+
         self._validar_conf()
         self._build_ui()
 
@@ -479,6 +558,21 @@ class DataExPYApp(ctk.CTk):
             font=("Segoe UI", 14, "bold"), text_color=COLOR_TEXT,
         ).pack(anchor="w", pady=(0, 8))
 
+        # Status badge
+        self.status_badge = ctk.CTkLabel(
+            parent, text="🟡 Sin procesar",
+            font=("Segoe UI", 10), text_color="#94a3b8",
+        )
+        self.status_badge.pack(anchor="w", pady=(0, 6))
+
+        # Progress bar
+        self.progress_bar = ctk.CTkProgressBar(
+            parent, fg_color="#334155", progress_color="#22c55e",
+            height=6, corner_radius=3,
+        )
+        self.progress_bar.pack(fill="x", pady=(0, 10))
+        self.progress_bar.set(0)
+
         # Cards de resultados
         self.cards_frame = ctk.CTkFrame(parent, fg_color="transparent")
         self.cards_frame.pack(fill="x")
@@ -502,9 +596,16 @@ class DataExPYApp(ctk.CTk):
             exp_frame, text="📥  Exportar JSON", command=self._exportar_json,
             fg_color="#1e293b", hover_color="#334155",
             font=("Segoe UI", 12), height=36,
-        ).pack(side="left", fill="x", expand=True)
+        ).pack(side="left", padx=(0, 8), fill="x", expand=True)
 
-        # Botones de transcripción y búsqueda
+        self.btn_reporte = ctk.CTkButton(
+            exp_frame, text="📄  Reporte PDF", command=self._exportar_pdf,
+            fg_color="#1e293b", hover_color="#334155",
+            font=("Segoe UI", 12), height=36,
+        )
+        self.btn_reporte.pack(side="left", fill="x", expand=True)
+
+        # Botones de transcripción, búsqueda y vista previa
         tools_frame = ctk.CTkFrame(parent, fg_color="transparent")
         tools_frame.pack(fill="x", pady=(10, 0))
 
@@ -525,6 +626,15 @@ class DataExPYApp(ctk.CTk):
             state="disabled",
         )
         self.btn_buscar.pack(side="left", fill="x", expand=True)
+
+        self.btn_preview = ctk.CTkButton(
+            tools_frame, text="👁️  Ver original",
+            command=self._abrir_previsualizacion,
+            fg_color="#1e293b", hover_color="#334155",
+            font=("Segoe UI", 12), height=34,
+            state="disabled",
+        )
+        self.btn_preview.pack(side="left", padx=(8, 0), fill="x", expand=True)
 
         # Historial
         ctk.CTkLabel(
@@ -594,16 +704,27 @@ class DataExPYApp(ctk.CTk):
                     text=f"📄 {Path(path).name} ({len(texto):,} caracteres)",
                     text_color="#94a3b8",
                 )
-                self.status_bar.set(f"Archivo cargado: {Path(path).name}")
+                # Detectar si fue OCR
+                ocr_msg = " (OCR automático)" if Path(path).suffix.lower() == ".pdf" and len(texto.strip()) < 100 else ""
+                self.status_bar.set(f"Archivo cargado: {Path(path).name}{ocr_msg}")
+                registrar_accion("CARGAR_DOCUMENTO", estado="EXITO", archivo=Path(path).name)
             except Exception as e:
                 messagebox.showerror("Error", f"No se pudo leer el archivo:\n{e}")
                 self.status_bar.set("Error al leer archivo", ok=False)
+
+    def _mostrar_toast(self, mensaje: str, tipo: str = "success"):
+        try:
+            Toast(self, mensaje, tipo)
+        except Exception:
+            pass
 
     def _extraer_datos(self):
         # Prioridad: imagen cargada > texto manual
         if self.imagen_bytes:
             self.btn_extraer.configure(state="disabled", text="⏳ Analizando imagen...")
             self.status_bar.set("Procesando imagen con Groq Visión...")
+            self.progress_bar.set(0.2)
+            self.status_badge.configure(text="🟡 Procesando...", text_color="#eab308")
             threading.Thread(target=self._procesar_imagen, daemon=True).start()
             return
 
@@ -614,43 +735,90 @@ class DataExPYApp(ctk.CTk):
 
         self.btn_extraer.configure(state="disabled", text="⏳ Procesando...")
         self.status_bar.set("Procesando con Groq...")
+        self.progress_bar.set(0.2)
+        self.status_badge.configure(text="🟡 Procesando...", text_color="#eab308")
 
         threading.Thread(target=self._procesar, args=(texto,), daemon=True).start()
 
+    def _check_queue(self):
+        """Procesa mensajes del hilo secundario en el hilo principal (UI)."""
+        try:
+            while True:
+                msg = self.task_queue.get_nowait()
+                tipo = msg.get("tipo")
+
+                if tipo == "progreso":
+                    self.progress_bar.set(msg["valor"])
+                elif tipo == "resultado":
+                    self.ultimo_resultado = msg.get("datos")
+                    self.transcripcion_actual = msg.get("texto", "")
+                    if self.ultimo_resultado:
+                        self.ultimo_resultado["_timestamp"] = datetime.now().strftime("%H:%M:%S")
+                        self.historial.append(self.ultimo_resultado)
+                    self._mostrar_resultado(self.ultimo_resultado or {})
+                    self.status_bar.set(msg.get("status_msg", "Listo"))
+                    self._mostrar_toast(msg.get("toast_msg", "Completado"), "success")
+                elif tipo == "error":
+                    self.status_bar.set(msg.get("status_msg", "Error"), False)
+                    self._mostrar_toast(msg.get("toast_msg", "Error"), "error")
+                    messagebox.showerror("Error", msg.get("detail", "Error desconocido"))
+                elif tipo == "habilitar":
+                    self._habilitar_boton()
+        except queue.Empty:
+            pass
+        self.after(100, self._check_queue)
+
     def _procesar(self, texto: str):
         try:
+            self.task_queue.put({"tipo": "progreso", "valor": 0.4})
             datos = extraer(texto)
+            self.task_queue.put({"tipo": "progreso", "valor": 0.7})
             guardar(datos)
-            self.ultimo_resultado = datos
-            self.transcripcion_actual = texto
-            datos["_timestamp"] = datetime.now().strftime("%H:%M:%S")
-            self.historial.append(datos)
 
-            self.after(0, self._mostrar_resultado, datos)
-            self.after(0, self.status_bar.set, "Documento procesado y guardado en Supabase")
+            self.task_queue.put({
+                "tipo": "resultado",
+                "datos": datos,
+                "texto": texto,
+                "status_msg": "Documento procesado y guardado en Supabase",
+                "toast_msg": "Documento procesado con éxito",
+            })
         except Exception as e:
-            self.after(0, self.status_bar.set, f"Error: {e}", False)
-            self.after(0, messagebox.showerror, "Error", f"Error durante el procesamiento:\n{e}")
+            self.task_queue.put({
+                "tipo": "error",
+                "status_msg": f"Error: {e}",
+                "toast_msg": f"Error: {e}",
+                "detail": f"Error durante el procesamiento:\n{e}",
+            })
         finally:
-            self.after(0, self._habilitar_boton)
+            self.task_queue.put({"tipo": "habilitar"})
 
     def _procesar_imagen(self):
         try:
+            self.task_queue.put({"tipo": "progreso", "valor": 0.4})
             datos = procesar_con_transcripcion(self.imagen_bytes, self.imagen_mime)
-            self.ultimo_resultado = {
+            self.task_queue.put({"tipo": "progreso", "valor": 0.8})
+
+            resultado = {
                 k: v for k, v in datos.items() if k != "transcripcion_completa"
             }
-            self.transcripcion_actual = datos.get("transcripcion_completa", "")
-            self.ultimo_resultado["_timestamp"] = datetime.now().strftime("%H:%M:%S")
-            self.historial.append(self.ultimo_resultado)
+            transcripcion = datos.get("transcripcion_completa", "")
 
-            self.after(0, self._mostrar_resultado, self.ultimo_resultado)
-            self.after(0, self.status_bar.set, "Imagen procesada y guardada en Supabase")
+            self.task_queue.put({
+                "tipo": "resultado",
+                "datos": resultado,
+                "texto": transcripcion,
+                "status_msg": "Imagen procesada y guardada en Supabase",
+                "toast_msg": "Imagen procesada con éxito",
+            })
         except Exception as e:
-            self.after(0, self.status_bar.set, f"Error: {e}", False)
-            self.after(0, messagebox.showerror, "Error", f"Error al procesar imagen:\n{e}")
+            self.task_queue.put({
+                "tipo": "error",
+                "status_msg": f"Error: {e}",
+                "toast_msg": f"Error: {e}",
+                "detail": f"Error al procesar imagen:\n{e}",
+            })
         finally:
-            self.after(0, self._habilitar_boton)
+            self.task_queue.put({"tipo": "habilitar"})
 
     def _mostrar_resultado(self, datos: dict):
         self.card_cliente.actualizar(datos.get("cliente"))
@@ -662,10 +830,14 @@ class DataExPYApp(ctk.CTk):
             self.card_total.actualizar(None)
         self.card_id.actualizar(datos.get("id_documento"))
 
+        # Status badge verde
+        self.status_badge.configure(text="🟢 Procesado", text_color="#22c55e")
+
         # Activar botones si hay transcripción
         if self.transcripcion_actual:
             self.btn_transcripcion.configure(state="normal")
             self.btn_buscar.configure(state="normal")
+            self.btn_preview.configure(state="normal")
 
         # Actualizar historial
         self._actualizar_historial()
@@ -693,6 +865,9 @@ class DataExPYApp(ctk.CTk):
         if not self.transcripcion_actual:
             return
         win = ctk.CTkToplevel(self)
+        win.transient(self)
+        win.grab_set()
+        win.focus_set()
         win.title("📄 Transcripción completa del documento")
         win.geometry("750x550")
         win.minsize(500, 300)
@@ -717,6 +892,35 @@ class DataExPYApp(ctk.CTk):
             return
         BusquedaModal(self, self.transcripcion_actual, self._on_campo_extraido)
 
+    def _abrir_previsualizacion(self):
+        """Modal con el texto original del documento."""
+        if not self.transcripcion_actual:
+            return
+        win = ctk.CTkToplevel(self)
+        win.transient(self)
+        win.grab_set()
+        win.focus_set()
+        win.title("👁️ Documento original")
+        win.geometry("800x600")
+        win.minsize(500, 300)
+
+        container = ctk.CTkFrame(win, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(
+            container, text="Documento original",
+            font=("Segoe UI", 14, "bold"), text_color=COLOR_TEXT,
+        ).pack(anchor="w", pady=(0, 8))
+
+        txt = ctk.CTkTextbox(
+            container, wrap="word",
+            fg_color=COLOR_CARD, text_color=COLOR_TEXT,
+            font=("Consolas", 12), corner_radius=8,
+        )
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", self.transcripcion_actual)
+        txt.configure(state="disabled")
+
     def _on_campo_extraido(self, nombre_campo: str, valor):
         if not self.ultimo_resultado:
             return
@@ -726,6 +930,29 @@ class DataExPYApp(ctk.CTk):
             f"'{nombre_campo}' guardado en resultados.\n"
             "Exporta el JSON para verlo.",
         )
+
+    def _exportar_pdf(self):
+        if not self.ultimo_resultado:
+            messagebox.showinfo("Sin datos", "No hay resultados para exportar.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")],
+            initialfile=f"reporte_{datetime.now():%Y%m%d_%H%M%S}.pdf",
+        )
+        if not path:
+            return
+        try:
+            datos = dict(self.ultimo_resultado)
+            if self.transcripcion_actual:
+                datos["transcripcion_completa"] = self.transcripcion_actual
+            generar_reporte_pdf(datos, path)
+            self.status_bar.set(f"Reporte PDF generado: {Path(path).name}")
+            registrar_accion("GENERAR_PDF", estado="EXITO", archivo=Path(path).name)
+        except Exception as e:
+            registrar_accion("GENERAR_PDF", estado="FALLO", error=str(e))
+            messagebox.showerror("Error", f"Error al generar PDF:\n{e}")
+            self.status_bar.set("Error al generar PDF", ok=False)
 
     def _exportar_csv(self):
         if not self.ultimo_resultado:
@@ -743,6 +970,7 @@ class DataExPYApp(ctk.CTk):
             w.writeheader()
             w.writerow(self.ultimo_resultado)
         self.status_bar.set(f"Exportado a CSV: {Path(path).name}")
+        registrar_accion("EXPORTAR_CSV", estado="EXITO", archivo=Path(path).name)
 
     def _exportar_json(self):
         if not self.ultimo_resultado:
@@ -761,8 +989,30 @@ class DataExPYApp(ctk.CTk):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(export, f, indent=2, ensure_ascii=False)
         self.status_bar.set(f"Exportado a JSON: {Path(path).name}")
+        registrar_accion("EXPORTAR_JSON", estado="EXITO", archivo=Path(path).name)
 
     def _on_close(self):
+        """Confirma salida si hay documentos procesados o proceso activo."""
+        from tkinter import messagebox as _mb
+        tiene_resultados = self.ultimo_resultado is not None
+        tiene_historial = len(self.historial) > 0
+        procesando = self.btn_extraer.cget("text") != "🔍  Extraer datos"
+
+        if procesando:
+            _mb.showwarning("Proceso en curso", "Hay una extracción en progreso. Espera a que termine.")
+            return
+
+        if tiene_resultados or tiene_historial:
+            respuesta = _mb.askyesno(
+                "Confirmar salida",
+                "Tienes documentos procesados. ¿Seguro que quieres salir?\n"
+                "Los datos no exportados se perderán.",
+                icon="warning",
+            )
+            if not respuesta:
+                return
+
+        registrar_accion("CERRAR_APLICACION", estado="EXITO")
         self.destroy()
         sys.exit(0)
 

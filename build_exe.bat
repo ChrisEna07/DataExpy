@@ -2,6 +2,7 @@
 REM ============================================================
 REM  DataExPY by ChrizDev - Build script
 REM  Genera un .exe independiente en la carpeta dist/
+REM  Cada usuario debe crear su propio .env junto al .exe
 REM ============================================================
 title Building DataExPY by ChrizDev...
 
@@ -19,8 +20,8 @@ if %errorlevel% neq 0 (
 )
 
 echo [1/4] Limpiando builds anteriores...
-rmdir /s /q build 2>nul
-rmdir /s /q dist 2>nul
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
 
 echo [2/4] Generando .exe...
 pyinstaller ^
@@ -28,9 +29,12 @@ pyinstaller ^
     --windowed ^
     --name "DataExPY" ^
     --noconfirm ^
-    --add-data ".env;." ^
     --collect-all customtkinter ^
-    --icon NONE ^
+    --add-data "llm_client.py;." ^
+    --hidden-import pypdf ^
+    --hidden-import docx ^
+    --hidden-import PIL._tkinter_finder ^
+    --hidden-import fitz ^
     main.py
 
 if %errorlevel% neq 0 (
@@ -40,8 +44,8 @@ if %errorlevel% neq 0 (
 )
 
 echo [3/4] Limpiando archivos temporales...
-rmdir /s /q build 2>nul
-del DataExPY.spec 2>nul
+if exist build rmdir /s /q build
+if exist DataExPY.spec del DataExPY.spec
 
 echo [4/4] Hecho!
 echo.
@@ -50,8 +54,12 @@ echo  EJECUTABLE GENERADO:
 echo    dist\DataExPY.exe
 echo ============================================================
 echo.
-echo  IMPORTANTE: Copia el archivo .env junto al .exe
-echo  o el programa no podra conectarse a Groq/Supabase.
+echo  IMPORTANTE: Copia el archivo .env junto al .exe:
 echo.
-
+echo    GROQ_API_KEY="gsk_tu_key"
+echo    GEMINI_API_KEY="AIza_tu_key"
+echo    SUPABASE_URL="https://tu-proyecto.supabase.co"
+echo    SUPABASE_KEY="sb_secret_tu_key"
+echo    LOG_LEVEL="INFO"
+echo.
 pause

@@ -35,3 +35,7 @@ Desktop.ini
 .vscode/
 .idea/
 *.sublime-*
+
+# Fonts (propietarias, no redistribuibles)
+fonts/*.ttf
+!fonts/.gitkeep
