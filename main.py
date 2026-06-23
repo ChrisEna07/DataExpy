@@ -11,8 +11,18 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from pypdf import PdfReader
 from docx import Document
+from PIL import Image, ImageTk
 
-from extractor import extraer, guardar, Settings
+from extractor import (
+    extraer,
+    guardar,
+    procesar_imagen,
+    procesar_con_transcripcion,
+    transcribir_imagen,
+    extraer_campos_dinamico,
+    buscar_en_texto,
+    Settings,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -61,6 +71,17 @@ def leer_archivo(path: str) -> str:
             return f.read()
     else:
         raise ValueError(f"Formato no soportado: {ext}")
+
+
+def es_imagen(path: str) -> bool:
+    return Path(path).suffix.lower() in (".jpg", ".jpeg", ".png")
+
+
+def leer_imagen(path: str) -> tuple[bytes, str]:
+    ext = Path(path).suffix.lower()
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(ext, "image/jpeg")
+    with open(path, "rb") as f:
+        return f.read(), mime
 
 
 def validar_config() -> str | None:
@@ -145,6 +166,185 @@ class StatusBar(ctk.CTkFrame):
 
 
 # ---------------------------------------------------------------------------
+# Modal de búsqueda en documento
+# ---------------------------------------------------------------------------
+
+KEYWORD_SUGERIDAS = [
+    "C.C.", "NIT", "Cédula", "Pasaporte", "Dirección",
+    "Teléfono", "Email", "Correo", "Celular",
+    "Cliente", "Proveedor", "Contratante", "Contratista",
+    "Fecha", "Total", "Subtotal", "IVA", "Descuento",
+    "ID", "Factura", "Contrato", "Referencia",
+    "Banco", "Cuenta", "Firma", "Cargo",
+]
+
+
+class BusquedaModal(ctk.CTkToplevel):
+    def __init__(self, master, texto_documento: str, on_extraer_campo=None):
+        super().__init__(master)
+        self.texto = texto_documento
+        self.on_extraer_campo = on_extraer_campo
+        self._resultados_actuales: list[dict] = []
+
+        self.title("🔍 Buscar en documento")
+        self.geometry("750x580")
+        self.minsize(600, 400)
+
+        # Centrar
+        self.after(100, lambda: self._centrar())
+
+        self._build_ui()
+
+    def _centrar(self):
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//3}")
+
+    def _build_ui(self):
+        # Buscador
+        busca_frame = ctk.CTkFrame(self, fg_color="transparent")
+        busca_frame.pack(fill="x", padx=15, pady=(15, 8))
+
+        self.entry_busqueda = ctk.CTkEntry(
+            busca_frame, placeholder_text="Escribe lo que buscas...",
+            font=("Segoe UI", 13), height=38,
+            fg_color=COLOR_CARD, text_color=COLOR_TEXT,
+            border_width=1, border_color="#334155",
+        )
+        self.entry_busqueda.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.entry_busqueda.bind("<Return>", lambda e: self._ejecutar_busqueda())
+
+        ctk.CTkButton(
+            busca_frame, text="Buscar", command=self._ejecutar_busqueda,
+            fg_color="#22c55e", hover_color="#16a34a",
+            font=("Segoe UI", 12, "bold"), height=38, width=100,
+            text_color="white",
+        ).pack(side="right")
+
+        # Keywords sugeridas
+        ctk.CTkLabel(
+            self, text="Palabras clave sugeridas:",
+            font=("Segoe UI", 11), text_color=COLOR_LABEL,
+        ).pack(anchor="w", padx=15, pady=(0, 6))
+
+        keywords_frame = ctk.CTkScrollableFrame(
+            self, fg_color="transparent", height=60,
+        )
+        keywords_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        for kw in KEYWORD_SUGERIDAS:
+            btn = ctk.CTkButton(
+                keywords_frame, text=kw,
+                command=lambda k=kw: self._click_keyword(k),
+                fg_color=COLOR_ACCENT, hover_color="#1a5276",
+                font=("Segoe UI", 11), height=28,
+                width=len(kw) * 9 + 20,
+            )
+            btn.pack(side="left", padx=3, pady=2)
+
+        # Resultados
+        ctk.CTkLabel(
+            self, text="Resultados:",
+            font=("Segoe UI", 12, "bold"), text_color=COLOR_TEXT,
+        ).pack(anchor="w", padx=15, pady=(0, 4))
+
+        self.resultados_text = ctk.CTkTextbox(
+            self, wrap="word",
+            fg_color=COLOR_CARD, text_color=COLOR_TEXT,
+            font=("Consolas", 11), corner_radius=8,
+            border_width=1, border_color="#334155",
+            state="disabled",
+        )
+        self.resultados_text.pack(fill="both", expand=True, padx=15, pady=(0, 8))
+
+        # Botón extraer campo
+        action_frame = ctk.CTkFrame(self, fg_color="transparent")
+        action_frame.pack(fill="x", padx=15, pady=(0, 12))
+
+        self.btn_extraer_campo = ctk.CTkButton(
+            action_frame, text="➕ Extraer como campo personalizado",
+            command=self._extraer_como_campo,
+            fg_color="#0f3460", hover_color="#1a5276",
+            font=("Segoe UI", 12), height=36,
+            state="disabled",
+        )
+        self.btn_extraer_campo.pack(side="left", padx=(0, 8), fill="x", expand=True)
+
+        ctk.CTkButton(
+            action_frame, text="Cerrar", command=self.destroy,
+            fg_color="#ef4444", hover_color="#dc2626",
+            font=("Segoe UI", 12), height=36, width=100,
+        ).pack(side="right")
+
+    def _click_keyword(self, kw: str):
+        self.entry_busqueda.delete(0, "end")
+        self.entry_busqueda.insert(0, kw)
+        self._ejecutar_busqueda()
+
+    def _ejecutar_busqueda(self):
+        query = self.entry_busqueda.get().strip()
+        if not query:
+            return
+
+        self._resultados_actuales = buscar_en_texto(self.texto, query)
+
+        self.resultados_text.configure(state="normal")
+        self.resultados_text.delete("1.0", "end")
+
+        if not self._resultados_actuales:
+            self.resultados_text.insert("end", "🔍 Sin resultados.\n")
+            self.btn_extraer_campo.configure(state="disabled")
+        else:
+            self.resultados_text.insert(
+                "end",
+                f"🔍 {len(self._resultados_actuales)} ocurrencia(s) de '{query}':\n\n",
+            )
+            for r in self._resultados_actuales:
+                antes = r["antes"][-40:].rjust(40) if r["antes"] else ""
+                despues = r["despues"][:40].ljust(40) if r["despues"] else ""
+                linea = (
+                    f"  ── Línea {r['linea']} ──\n"
+                    f"  ...{antes}[{r['match']}]{despues}...\n\n"
+                )
+                self.resultados_text.insert("end", linea)
+
+            self.resultados_text.see("1.0")
+            self.btn_extraer_campo.configure(state="normal")
+
+        self.resultados_text.configure(state="disabled")
+
+    def _extraer_como_campo(self):
+        query = self.entry_busqueda.get().strip()
+        if not query or not self._resultados_actuales:
+            return
+
+        # Usar IA para extraer el campo del documento completo
+        try:
+            resultado = extraer_campos_dinamico(self.texto, [query])
+            valor = resultado.get(query)
+            if valor:
+                if self.on_extraer_campo:
+                    self.on_extraer_campo(query, valor)
+                self.resultados_text.configure(state="normal")
+                self.resultados_text.insert(
+                    "end",
+                    f"\n✅ Campo '{query}' extraído: {valor}\n",
+                )
+                self.resultados_text.configure(state="disabled")
+            else:
+                messagebox.showinfo(
+                    "Sin valor",
+                    f"No se encontró un valor claro para '{query}'.\n"
+                    "Revisa los resultados manualmente.",
+                )
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al extraer campo:\n{e}")
+
+
+# ---------------------------------------------------------------------------
 # Ventana principal
 # ---------------------------------------------------------------------------
 
@@ -161,6 +361,9 @@ class DataExPYApp(ctk.CTk):
 
         self.historial: list[dict] = []
         self.ultimo_resultado: dict | None = None
+        self.transcripcion_actual: str | None = None
+        self.imagen_bytes: bytes | None = None
+        self.imagen_mime: str | None = None
 
         self._validar_conf()
         self._build_ui()
@@ -232,6 +435,17 @@ class DataExPYApp(ctk.CTk):
         self.text_input.pack(fill="x", pady=(0, 8))
         self.text_input.insert("1.0", "Pega aquí el contenido del documento legal...")
 
+        # Vista previa de imagen
+        self.img_preview_label = ctk.CTkLabel(
+            parent, text="",
+            fg_color="transparent",
+        )
+
+        self.img_path_label = ctk.CTkLabel(
+            parent, text="",
+            font=("Segoe UI", 10), text_color=COLOR_LABEL,
+        )
+
         # Botones
         btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
         btn_frame.pack(fill="x", pady=(0, 10))
@@ -252,7 +466,7 @@ class DataExPYApp(ctk.CTk):
         )
         self.btn_extraer.pack(side="left", fill="x", expand=True)
 
-        # Vista previa del archivo cargado
+        # Labels de archivo cargado
         self.archivo_label = ctk.CTkLabel(
             parent, text="",
             font=("Segoe UI", 10), text_color=COLOR_LABEL,
@@ -290,6 +504,28 @@ class DataExPYApp(ctk.CTk):
             font=("Segoe UI", 12), height=36,
         ).pack(side="left", fill="x", expand=True)
 
+        # Botones de transcripción y búsqueda
+        tools_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        tools_frame.pack(fill="x", pady=(10, 0))
+
+        self.btn_transcripcion = ctk.CTkButton(
+            tools_frame, text="📄  Ver transcripción",
+            command=self._abrir_transcripcion,
+            fg_color="#1e293b", hover_color="#334155",
+            font=("Segoe UI", 12), height=34,
+            state="disabled",
+        )
+        self.btn_transcripcion.pack(side="left", padx=(0, 8), fill="x", expand=True)
+
+        self.btn_buscar = ctk.CTkButton(
+            tools_frame, text="🔍  Buscar en documento",
+            command=self._abrir_busqueda,
+            fg_color="#1e293b", hover_color="#334155",
+            font=("Segoe UI", 12), height=34,
+            state="disabled",
+        )
+        self.btn_buscar.pack(side="left", fill="x", expand=True)
+
         # Historial
         ctk.CTkLabel(
             parent, text="📚 Historial",
@@ -313,27 +549,64 @@ class DataExPYApp(ctk.CTk):
         path = filedialog.askopenfilename(
             title="Seleccionar documento",
             filetypes=[
-                ("Documentos", "*.pdf *.docx *.txt"),
+                ("Todos los documentos", "*.pdf *.docx *.txt *.jpg *.jpeg *.png"),
                 ("PDF", "*.pdf"), ("Word", "*.docx"), ("Texto", "*.txt"),
+                ("Imágenes", "*.jpg *.jpeg *.png"),
             ],
         )
         if not path:
             return
 
-        try:
-            texto = leer_archivo(path)
-            self.text_input.delete("1.0", "end")
-            self.text_input.insert("1.0", texto)
-            self.archivo_label.configure(
-                text=f"📄 {Path(path).name} ({len(texto):,} caracteres)",
-                text_color="#94a3b8",
-            )
-            self.status_bar.set(f"Archivo cargado: {Path(path).name}")
-        except Exception as e:
-            messagebox.showerror("Error", f"No se pudo leer el archivo:\n{e}")
-            self.status_bar.set(f"Error al leer archivo", ok=False)
+        # Resetear estado de imagen
+        self.imagen_bytes = None
+        self.imagen_mime = None
+        self.img_preview_label.pack_forget()
+        self.img_path_label.pack_forget()
+
+        if es_imagen(path):
+            try:
+                data, mime = leer_imagen(path)
+                self.imagen_bytes = data
+                self.imagen_mime = mime
+
+                # Mostrar preview
+                img = Image.open(path)
+                img.thumbnail((280, 200))
+                tk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                self.img_preview_label.configure(image=tk_img, text="")
+                self.img_preview_label.pack(pady=(0, 6))
+                self.img_path_label.configure(
+                    text=f"🖼️ {Path(path).name} (imagen)",
+                    text_color="#94a3b8",
+                )
+                self.img_path_label.pack(anchor="w")
+                self.text_input.delete("1.0", "end")
+                self.status_bar.set(f"Imagen cargada: {Path(path).name}")
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo leer la imagen:\n{e}")
+                self.status_bar.set("Error al leer imagen", ok=False)
+        else:
+            try:
+                texto = leer_archivo(path)
+                self.text_input.delete("1.0", "end")
+                self.text_input.insert("1.0", texto)
+                self.archivo_label.configure(
+                    text=f"📄 {Path(path).name} ({len(texto):,} caracteres)",
+                    text_color="#94a3b8",
+                )
+                self.status_bar.set(f"Archivo cargado: {Path(path).name}")
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo leer el archivo:\n{e}")
+                self.status_bar.set("Error al leer archivo", ok=False)
 
     def _extraer_datos(self):
+        # Prioridad: imagen cargada > texto manual
+        if self.imagen_bytes:
+            self.btn_extraer.configure(state="disabled", text="⏳ Analizando imagen...")
+            self.status_bar.set("Procesando imagen con Groq Visión...")
+            threading.Thread(target=self._procesar_imagen, daemon=True).start()
+            return
+
         texto = self.text_input.get("1.0", "end").strip()
         if not texto or texto == "Pega aquí el contenido del documento legal...":
             messagebox.showwarning("Sin contenido", "Ingresa texto o carga un archivo primero.")
@@ -349,6 +622,7 @@ class DataExPYApp(ctk.CTk):
             datos = extraer(texto)
             guardar(datos)
             self.ultimo_resultado = datos
+            self.transcripcion_actual = texto
             datos["_timestamp"] = datetime.now().strftime("%H:%M:%S")
             self.historial.append(datos)
 
@@ -357,6 +631,24 @@ class DataExPYApp(ctk.CTk):
         except Exception as e:
             self.after(0, self.status_bar.set, f"Error: {e}", False)
             self.after(0, messagebox.showerror, "Error", f"Error durante el procesamiento:\n{e}")
+        finally:
+            self.after(0, self._habilitar_boton)
+
+    def _procesar_imagen(self):
+        try:
+            datos = procesar_con_transcripcion(self.imagen_bytes, self.imagen_mime)
+            self.ultimo_resultado = {
+                k: v for k, v in datos.items() if k != "transcripcion_completa"
+            }
+            self.transcripcion_actual = datos.get("transcripcion_completa", "")
+            self.ultimo_resultado["_timestamp"] = datetime.now().strftime("%H:%M:%S")
+            self.historial.append(self.ultimo_resultado)
+
+            self.after(0, self._mostrar_resultado, self.ultimo_resultado)
+            self.after(0, self.status_bar.set, "Imagen procesada y guardada en Supabase")
+        except Exception as e:
+            self.after(0, self.status_bar.set, f"Error: {e}", False)
+            self.after(0, messagebox.showerror, "Error", f"Error al procesar imagen:\n{e}")
         finally:
             self.after(0, self._habilitar_boton)
 
@@ -369,6 +661,11 @@ class DataExPYApp(ctk.CTk):
         else:
             self.card_total.actualizar(None)
         self.card_id.actualizar(datos.get("id_documento"))
+
+        # Activar botones si hay transcripción
+        if self.transcripcion_actual:
+            self.btn_transcripcion.configure(state="normal")
+            self.btn_buscar.configure(state="normal")
 
         # Actualizar historial
         self._actualizar_historial()
@@ -392,6 +689,44 @@ class DataExPYApp(ctk.CTk):
     def _habilitar_boton(self):
         self.btn_extraer.configure(state="normal", text="🔍  Extraer datos")
 
+    def _abrir_transcripcion(self):
+        if not self.transcripcion_actual:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("📄 Transcripción completa del documento")
+        win.geometry("750x550")
+        win.minsize(500, 300)
+
+        txt = ctk.CTkTextbox(
+            win, wrap="word",
+            fg_color=COLOR_CARD, text_color=COLOR_TEXT,
+            font=("Consolas", 12), corner_radius=8,
+        )
+        txt.pack(fill="both", expand=True, padx=15, pady=15)
+        txt.insert("1.0", self.transcripcion_actual)
+        txt.configure(state="disabled")
+
+        ctk.CTkButton(
+            win, text="Cerrar", command=win.destroy,
+            fg_color=COLOR_ACCENT, hover_color="#1a5276",
+            font=("Segoe UI", 12), height=36,
+        ).pack(pady=(0, 12))
+
+    def _abrir_busqueda(self):
+        if not self.transcripcion_actual:
+            return
+        BusquedaModal(self, self.transcripcion_actual, self._on_campo_extraido)
+
+    def _on_campo_extraido(self, nombre_campo: str, valor):
+        if not self.ultimo_resultado:
+            return
+        self.ultimo_resultado[nombre_campo] = valor
+        messagebox.showinfo(
+            "Campo extraído",
+            f"'{nombre_campo}' guardado en resultados.\n"
+            "Exporta el JSON para verlo.",
+        )
+
     def _exportar_csv(self):
         if not self.ultimo_resultado:
             messagebox.showinfo("Sin datos", "No hay resultados para exportar.")
@@ -413,6 +748,9 @@ class DataExPYApp(ctk.CTk):
         if not self.ultimo_resultado:
             messagebox.showinfo("Sin datos", "No hay resultados para exportar.")
             return
+        export = dict(self.ultimo_resultado)
+        if self.transcripcion_actual:
+            export["transcripcion_completa"] = self.transcripcion_actual
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
@@ -421,7 +759,7 @@ class DataExPYApp(ctk.CTk):
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.ultimo_resultado, f, indent=2, ensure_ascii=False)
+            json.dump(export, f, indent=2, ensure_ascii=False)
         self.status_bar.set(f"Exportado a JSON: {Path(path).name}")
 
     def _on_close(self):

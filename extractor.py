@@ -1,9 +1,12 @@
 import os
+import re
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+import base64
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -30,6 +33,7 @@ class Settings:
     supabase_url: str = field(default_factory=lambda: os.getenv("SUPABASE_URL", ""))
     supabase_key: str = field(default_factory=lambda: os.getenv("SUPABASE_KEY", ""))
     groq_model: str = "openai/gpt-oss-20b"
+    groq_vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     max_retries: int = 3
     retry_delay: float = 2.0
 
@@ -69,6 +73,43 @@ REGLAS:
 4. Si detectas información sensible (tarjetas, contraseñas, direcciones privadas),
    reemplázala por '[PROTEGIDO]'.
 5. El campo 'total' debe ser float, sin símbolos de moneda ni separadores de miles."""
+
+
+VISION_SYSTEM_PROMPT = """Actúa como un experto en OCR y Análisis de Documentos.
+Analiza la imagen adjunta y extrae la información solicitada.
+
+Si la imagen es borrosa o ilegible, indica 'Calidad insuficiente' en el campo cliente.
+
+Extrae el texto utilizando visión computacional.
+
+REGLAS:
+1. Devuelve EXCLUSIVAMENTE un JSON válido con este esquema exacto:
+   {"cliente": "Nombre completo", "fecha": "AAAA-MM-DD", "total": 0.0, "id_documento": "Código"}
+2. Si un dato no existe en el texto, usa null (no lo inventes).
+3. Si detectas información sensible (tarjetas, contraseñas, direcciones privadas),
+   reemplázala por '[PROTEGIDO]'.
+4. El campo 'total' debe ser float, sin símbolos de moneda ni separadores de miles.
+5. Si detectas que es un documento escaneado, ignora el ruido visual y enfócate en los datos contables."""
+
+
+TRANSCRIBE_PROMPT = """Transcribe TODO el texto visible en esta imagen con la máxima precisión posible.
+Devuelve EXCLUSIVAMENTE el texto transcrito, sin comentarios, ni análisis, ni JSON.
+Respeta el formato original, saltos de línea y estructura del documento."""
+
+EXTRACT_FIELDS_PROMPT = """Actúa como un extractor de datos. Dado el texto de un documento legal,
+extrae ÚNICAMENTE los campos solicitados y devuélvelos como JSON.
+
+REGLAS:
+1. Responde solo con un JSON válido, sin texto adicional.
+2. Usa los nombres de campo exactos que se te piden.
+3. Si un dato no existe, usa null.
+4. Si hay datos sensibles (tarjetas, contraseñas), usa '[PROTEGIDO]'.
+5. Números deben ir como strings a menos que sean montos (float).
+
+Documento:
+{texto}
+
+Campos solicitados: {campos_json}"""
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +231,205 @@ def guardar(datos: dict) -> dict:
 
 def procesar_documento(texto: str) -> dict:
     datos = extraer(texto)
+    guardar(datos)
+    return datos
+
+
+# ---------------------------------------------------------------------------
+# Extracción desde imagen (visión)
+# ---------------------------------------------------------------------------
+
+def extraer_imagen(base64_image: str, mime_type: str = "image/jpeg") -> dict:
+    _init()
+    last_error = None
+    model = _settings.groq_vision_model
+
+    for attempt in range(1, _settings.max_retries + 1):
+        try:
+            log.info("Extracción visión — intento %d/%d (%s)", attempt, _settings.max_retries, model)
+            response = _ai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Extrae los datos de la imagen en formato JSON.",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{base64_image}"
+                                },
+                            },
+                        ],
+                    },
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                max_tokens=1024,
+            )
+            raw = response.choices[0].message.content
+            datos = json.loads(raw)
+            _validar_esquema(datos)
+            _normalizar(datos)
+            log.info("Extracción visión exitosa: %s", datos)
+            return datos
+
+        except json.JSONDecodeError as e:
+            log.warning("JSON inválido (intento %d): %s", attempt, e)
+            last_error = e
+        except (KeyError, TypeError, ValueError) as e:
+            log.warning("Esquema inválido (intento %d): %s", attempt, e)
+            last_error = e
+        except Exception as e:
+            log.warning("Error en API visión (intento %d): %s", attempt, e)
+            last_error = e
+
+        if attempt < _settings.max_retries:
+            time.sleep(_settings.retry_delay * attempt)
+
+    msg = f"Extracción de imagen fallida tras {_settings.max_retries} intentos"
+    if last_error:
+        msg += f". Último error: {last_error}"
+    log.error(msg)
+    raise RuntimeError(msg) from last_error
+
+
+def procesar_imagen(file_bytes: bytes, mime_type: str) -> dict:
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    datos = extraer_imagen(b64, mime_type)
+    guardar(datos)
+    return datos
+
+
+# ---------------------------------------------------------------------------
+# Transcripción completa (OCR con IA)
+# ---------------------------------------------------------------------------
+
+def transcribir_imagen(file_bytes: bytes, mime_type: str) -> str:
+    _init()
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    model = _settings.groq_vision_model
+    last_error = None
+
+    for attempt in range(1, _settings.max_retries + 1):
+        try:
+            log.info("Transcripción — intento %d/%d (%s)", attempt, _settings.max_retries, model)
+            response = _ai_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": TRANSCRIBE_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Transcribe todo el texto del documento.",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{b64}"
+                                },
+                            },
+                        ],
+                    },
+                ],
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            texto = response.choices[0].message.content.strip()
+            if not texto:
+                raise ValueError("Transcripción vacía")
+            log.info("Transcripción exitosa (%d caracteres)", len(texto))
+            return texto
+
+        except Exception as e:
+            log.warning("Transcripción fallida (intento %d): %s", attempt, e)
+            last_error = e
+
+        if attempt < _settings.max_retries:
+            time.sleep(_settings.retry_delay * attempt)
+
+    raise RuntimeError(f"Transcripción fallida tras {_settings.max_retries} intentos") from last_error
+
+
+# ---------------------------------------------------------------------------
+# Extracción dinámica de campos
+# ---------------------------------------------------------------------------
+
+def extraer_campos_dinamico(texto: str, campos: list[str]) -> dict:
+    _init()
+    if not campos:
+        return {}
+
+    prompt = EXTRACT_FIELDS_PROMPT.format(
+        texto=texto,
+        campos_json=json.dumps(campos, ensure_ascii=False),
+    )
+
+    for attempt in range(1, _settings.max_retries + 1):
+        try:
+            log.info("Extracción dinámica — intento %d/%d: %s", attempt, _settings.max_retries, campos)
+            response = _ai_client.chat.completions.create(
+                model=_settings.groq_model,
+                messages=[
+                    {"role": "system", "content": "Eres un extractor de datos. Responde solo con JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+            )
+            datos = json.loads(response.choices[0].message.content)
+            log.info("Extracción dinámica exitosa: %s", datos)
+            return datos
+
+        except Exception as e:
+            log.warning("Extracción dinámica fallida (intento %d): %s", attempt, e)
+            last_error = e
+
+        if attempt < _settings.max_retries:
+            time.sleep(_settings.retry_delay * attempt)
+
+    raise RuntimeError(f"Extracción dinámica fallida tras {_settings.max_retries} intentos") from last_error
+
+
+# ---------------------------------------------------------------------------
+# Búsqueda de texto en documento
+# ---------------------------------------------------------------------------
+
+def buscar_en_texto(texto: str, query: str, contexto: int = 60) -> list[dict]:
+    if not texto or not query:
+        return []
+
+    resultados = []
+    for match in re.finditer(re.escape(query), texto, re.IGNORECASE):
+        start = max(0, match.start() - contexto)
+        end = min(len(texto), match.end() + contexto)
+        antes = texto[start:match.start()]
+        despues = texto[match.end():end]
+        resultados.append({
+            "match": match.group(),
+            "antes": antes.strip(),
+            "despues": despues.strip(),
+            "posicion": match.start(),
+            "linea": texto[:match.start()].count("\n") + 1,
+        })
+
+    return resultados
+
+
+# ---------------------------------------------------------------------------
+# Procesar documento con transcripción completa
+# ---------------------------------------------------------------------------
+
+def procesar_con_transcripcion(file_bytes: bytes, mime_type: str) -> dict:
+    transcripcion = transcribir_imagen(file_bytes, mime_type)
+    datos = extraer(transcripcion)
+    datos["transcripcion_completa"] = transcripcion
     guardar(datos)
     return datos
 
