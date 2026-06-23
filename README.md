@@ -1,18 +1,18 @@
 <div align="center">
 
 ```
-██████╗  █████╗ ████████╗ █████╗ ██████╗ ██╗  ██╗██████╗ ██╗   ██╗
-██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗██╔══ ╗╚██╗██╔╝██╔══██╗╚██╗ ██╔╝
-██║  ██║███████║   ██║   ███████║██████╔╝ ╚███╔╝ ██████╔╝ ╚████╔╝ 
-██║  ██║██╔══██║   ██║   ██╔══██║██╔══  ╗ ██╔██╗ ██╔═══╝   ╚██╔╝  
-██████╔╝██║  ██║   ██║   ██║  ██║██████╔╝██╔╝ ██╗██║        ██║   
-╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝        ╚═╝
+██████╗  █████╗ ████████╗ █████╗ ███████╗██╗  ██╗██╗   ██╗
+██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗██╔════╝╚██╗██╔╝╚██╗ ██╔╝
+██║  ██║███████║   ██║   ███████║█████╗   ╚███╔╝  ╚████╔╝
+██║  ██║██╔══██║   ██║   ██╔══██║██╔══╝   ██╔██╗   ╚██╔╝
+██████╔╝██║  ██║   ██║   ██║  ██║███████╗██╔╝ ██╗   ██║
+╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝
 
 ```
 
-**Extracción inteligente de datos en documentos legales · IA + Supabase**
+**Extracción inteligente de documentos legales con IA · OCR · Búsqueda inteligente**
 
-[![Groq](https://img.shields.io/badge/Groq-Llama_3-FF6600?style=flat-square&logo=groq)](https://groq.com)
+[![Groq](https://img.shields.io/badge/Groq-LLM_+_Visión-FF6600?style=flat-square&logo=groq)](https://groq.com)
 [![Supabase](https://img.shields.io/badge/Supabase-Database-3ECF8E?style=flat-square&logo=supabase)](https://supabase.com)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python)](https://python.org)
 [![Licencia](https://img.shields.io/badge/Licencia-MIT-green?style=flat-square)](LICENSE)
@@ -20,8 +20,9 @@
 
 ---
 
-**Transforma contratos, facturas y recibos en datos estructurados al instante.**
-Sin OCR, sin plantillas, sin reglas manuales. Solo pega el texto y la IA extrae: cliente, fecha, total e ID del documento.
+**Sube un contrato, factura o recibo — la IA lo transcribe, extrae los datos y te deja buscar cualquier campo.**
+
+Fotos de documentos, PDFs escaneados, capturas de pantalla... o texto plano. Sin plantillas, sin reglas manuales.
 
 </div>
 
@@ -31,11 +32,15 @@ Sin OCR, sin plantillas, sin reglas manuales. Solo pega el texto y la IA extrae:
 
 | Característica | Descripción |
 |---|---|
-| **🤖 IA Legal** | Groq (GPT-OSS 20B) entrenado vía prompt para extraer datos legales con precisión |
-| **📂 Múltiples formatos** | PDF, DOCX, TXT — arrastra o selecciona, el texto se extrae automáticamente |
+| **🤖 IA Legal** | Groq (GPT-OSS 20B) + modelo de visión (Llama 4 Scout) para texto e imágenes |
+| **📸 OCR con IA** | Escanea fotos de documentos, capturas de pantalla, JPG/PNG — la IA transcribe todo |
+| **📂 Múltiples formatos** | PDF, DOCX, TXT, **JPG, JPEG, PNG** |
+| **📄 Transcripción completa** | Botón "Ver transcripción" con el texto íntegro extraído del documento |
+| **🔍 Buscador inteligente** | Modal con keywords sugeridas + búsqueda libre + resultados con contexto |
+| **🎯 Extracción dinámica** | Busca C.C., NIT, dirección, teléfono, email, o cualquier campo y extrae su valor con IA |
 | **🔒 Anonimización** | Datos sensibles (tarjetas, contraseñas, direcciones) → `[PROTEGIDO]` |
 | **💾 Persistencia** | Los datos viajan directo a Supabase — listos para analítica o RAG |
-| **📤 Exportación** | Descarga los resultados en CSV o JSON con un clic |
+| **📤 Exportación** | CSV o JSON con un clic (la transcripción se incluye en el JSON) |
 | **📋 Historial** | Todas las extracciones se acumulan en sesión |
 | **🎨 Interfaz nativa** | App de escritorio Windows con dark mode, sin depender de un navegador |
 | **📦 Ejecutable portátil** | Compila a un solo `.exe` — sin Python, sin dependencias |
@@ -45,28 +50,37 @@ Sin OCR, sin plantillas, sin reglas manuales. Solo pega el texto y la IA extrae:
 ## 🧠 Arquitectura
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    DataExPY Desktop App                     │
-│  ┌──────────────┐          ┌──────────────────────────┐    │
-│  │  Entrada      │          │  Resultados               │    │
-│  │  · Texto      │          │  · Cliente  · Fecha      │    │
-│  │  · PDF/DOCX   │  ──────→ │  · Total    · ID Doc     │    │
-│  │  · TXT        │   Groq   │  · Export CSV/JSON       │    │
-│  └──────────────┘          └──────────┬───────────────┘    │
-└───────────────────────────────────────┼────────────────────┘
-                                        │
-                              ┌─────────▼─────────┐
-                              │   Supabase DB      │
-                              │  documentos_legales│
-                              └───────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                       DataExPY Desktop App                        │
+│  ┌──────────────────┐          ┌────────────────────────────┐    │
+│  │  Entrada          │          │  Resultados                │    │
+│  │  · Texto          │          │  · Cliente  · Fecha       │    │
+│  │  · PDF/DOCX/TXT   │  ──────→ │  · Total    · ID Doc      │    │
+│  │  · JPG/JPEG/PNG   │   Groq   │  · 📄 Transcripción      │    │
+│  │  ↳ vista previa   │          │  · 🔍 Buscador + Keywords│    │
+│  └────────┬─────────┘          │  · Export CSV/JSON         │    │
+│           │                    └──────────┬─────────────────┘    │
+│           ▼                                       │              │
+│  ┌──────────────────┐                            │              │
+│  │  OCR con IA      │                            │              │
+│  │  (Visión → Texto)│                            │              │
+│  └──────────────────┘                            │              │
+└──────────────────────────────────────────────────┼──────────────┘
+                                                   ▼
+                                         ┌──────────────────┐
+                                         │   Supabase DB     │
+                                         │ documentos_legales│
+                                         │ + transcripción   │
+                                         └──────────────────┘
 ```
 
 **Flujo de datos:**
-1. Cargas un documento o pegas texto
-2. Se envía a **Groq** con un prompt especializado en datos legales
-3. La IA devuelve un JSON estructurado con los 4 campos
-4. Los datos se **validan, normalizan y guardan** en Supabase
-5. La UI muestra los resultados y permite exportarlos
+1. Cargas texto, un PDF/DOCX o una **imagen** (foto de documento, captura de pantalla)
+2. Si es imagen → **OCR con IA** (Groq Visión) la transcribe a texto completo
+3. El texto se envía a **Groq** con un prompt especializado en datos legales → extrae cliente, fecha, total, ID
+4. Los datos se **validan, normalizan y guardan** en Supabase (junto con la transcripción)
+5. La UI muestra resultados + botones para **ver transcripción** y **buscar dentro del documento**
+6. El **buscador inteligente** permite buscar cualquier palabra clave (C.C., NIT, dirección, etc.) con resultados contextuales y extracción dinámica vía IA
 
 ---
 
@@ -141,6 +155,7 @@ CREATE TABLE documentos_legales (
   fecha DATE,
   total NUMERIC(12,2),
   id_documento TEXT,
+  transcripcion_completa TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ```
@@ -149,47 +164,95 @@ CREATE TABLE documentos_legales (
 
 ## 🎯 Uso
 
-### Cargar un documento
+### 1. Cargar un documento
 
-1. **Pega texto** directamente en el área de texto, o
-2. Haz clic en **"Seleccionar archivo"** y elige un PDF, DOCX o TXT
+| Tipo | Cómo |
+|---|---|
+| **Texto** | Pégalo directamente en el área de texto |
+| **PDF / DOCX / TXT** | Haz clic en "Seleccionar archivo" |
+| **Imagen** (JPG/PNG) | Selecciona el archivo — se muestra una **vista previa** |
 
-### Extraer datos
+### 2. Extraer datos
 
 3. Presiona **"Extraer datos"**
-4. La IA procesa el documento en segundos
+4. Para imágenes: la IA primero transcribe el documento (OCR), luego extrae los campos
 5. Los campos aparecen en las tarjetas de la derecha
 
-### Exportar
+### 3. Explorar el documento
 
-6. Usa los botones **CSV** o **JSON** para descargar los resultados
-7. El historial acumula todas las extracciones de la sesión
+| Botón | Qué hace |
+|---|---|
+| **📄 Ver transcripción** | Abre el texto completo extraído del documento |
+| **🔍 Buscar en documento** | Abre el buscador inteligente con keywords |
+
+### 4. Buscar y extraer campos personalizados
+
+```
+┌─────────────────────────────────────────┐
+│  [Escribe lo que buscas...]  [Buscar]   │
+│                                         │
+│  Palabras clave sugeridas:              │
+│  [C.C.] [NIT] [Dirección] [Teléfono]   │
+│  [Email] [Cliente] [Total] [Banco]     │
+│  [Factura] [Contrato] [Cédula] ...     │
+│                                         │
+│  Resultados:                            │
+│  ┌─────────────────────────────────┐   │
+│  │  3 ocurrencia(s) de 'C.C.':   │   │
+│  │  ── Línea 12 ──              │   │
+│  │  ...[C.C. 1234567890]...     │   │
+│  │  ── Línea 45 ──              │   │
+│  │  ...[C.C. 9876543210]...     │   │
+│  └─────────────────────────────────┘   │
+│                                         │
+│  [➕ Extraer como campo personalizado]  │
+└─────────────────────────────────────────┘
+```
+
+- **Haz clic en cualquier keyword** → auto-busca
+- **Escribe lo que quieras** (cédula, dirección, banco, etc.)
+- **"Extraer como campo"** → la IA captura el valor y lo agrega al resultado
+
+### 5. Exportar
+
+6. **CSV** → datos estructurados
+7. **JSON** → datos + transcripción completa
 
 ---
 
 ## 🔬 Ejemplo
 
-### Entrada
+### Entrada (imagen escaneada / texto)
 
 ```
-CONTRATO DE PRESTACIÓN DE SERVICIOS
-
-Entre: CARLOS ANDRÉS RAMÍREZ, identificado con cédula...
-Fecha del contrato: 15 de marzo de 2026
-Valor total del servicio: $2.850.000 COP
-Número de referencia: CONT-2026-0891
-...
+REPÚBLICA DE COLOMBIA
+CÉDULA DE CIUDADANÍA
+Número: 1.234.567.890
+Apellidos: GÓMEZ RESTREPO
+Nombres: MARÍA FERNANDA
+Fecha de expedición: 15-ENE-2020
 ```
 
 ### Salida
 
 ```json
 {
-  "cliente": "CARLOS ANDRÉS RAMÍREZ",
-  "fecha": "2026-03-15",
-  "total": 2850000.0,
-  "id_documento": "CONT-2026-0891"
+  "cliente": "MARÍA FERNANDA GÓMEZ RESTREPO",
+  "fecha": "2020-01-15",
+  "total": null,
+  "id_documento": "1.234.567.890",
+  "transcripcion_completa": "REPÚBLICA DE COLOMBIA\nCÉDULA DE CIUDADANÍA\n..."
 }
+```
+
+### Búsqueda
+
+```
+Buscar: "C.C." → 2 ocurrencias
+  ── Línea 12 ──  ...[C.C. 1234567890]...
+  ── Línea 45 ──  ...[C.C. 9876543210]...
+
+✅ Campo 'C.C.' extraído: "1.234.567.890"
 ```
 
 ---
@@ -208,9 +271,10 @@ Número de referencia: CONT-2026-0891
 
 | Tecnología | Propósito |
 |---|---|
-| [Groq](https://groq.com) | Inferencia ultrarrápida en LPU — modelo GPT-OSS 20B |
+| [Groq](https://groq.com) | Inferencia ultrarrápida — GPT-OSS 20B (texto) + Llama 4 Scout (visión/OCR) |
 | [Supabase](https://supabase.com) | Base de datos PostgreSQL + API REST |
 | [customtkinter](https://github.com/TomSchimansky/CustomTkinter) | UI nativa moderna con dark mode |
+| [Pillow](https://python-pillow.org) | Procesamiento y preview de imágenes |
 | [PyInstaller](https://pyinstaller.org) | Empaquetado en ejecutable portátil |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | Gestión segura de configuración |
 
@@ -219,18 +283,26 @@ Número de referencia: CONT-2026-0891
 ## 🧩 API (uso programático)
 
 ```python
-from extractor import extraer, guardar, procesar_documento
+from extractor import (
+    extraer,                    # Texto → campos
+    extraer_imagen,             # Base64 → campos
+    transcribir_imagen,         # Bytes → texto completo
+    extraer_campos_dinamico,    # Texto + lista de campos → valores
+    buscar_en_texto,            # Texto + query → coincidencias con contexto
+    procesar_con_transcripcion, # Bytes → campos + transcripción
+)
 
-# Extraer datos de un texto
+# Texto → campos estructurados
 datos = extraer("Cliente: Juan Pérez, Total: $1.500.000, ID: FAC-001")
-print(datos)
-# → {"cliente": "Juan Pérez", "total": 1500000.0, ...}
 
-# Guardar en Supabase
-guardar(datos)
+# Imagen → transcripción completa
+texto = transcribir_imagen(file_bytes, "image/jpeg")
 
-# O todo en uno
-procesar_documento("...texto del documento...")
+# Búsqueda dentro del texto
+resultados = buscar_en_texto(texto, "C.C.", contexto=60)
+
+# Extraer campo arbitrario
+campos = extraer_campos_dinamico(texto, ["C.C.", "dirección", "teléfono"])
 ```
 
 ---
@@ -256,7 +328,7 @@ print(resultado)
 
 <div align="center">
 
-**DataExPY by ChrizDev** · Transformando datos legales con inteligencia artificial
+**DataExPY by ChrizDev** · Transformando documentos legales con inteligencia artificial
 
 ⭐ Si te es útil, regálame una estrella. Reporta issues con cariño.
 
