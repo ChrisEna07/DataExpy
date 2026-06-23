@@ -56,7 +56,9 @@ Fotos de documentos, PDFs escaneados, capturas de pantalla... o texto plano. Sin
 | **🚪 Confirmación de salida** | Diálogo "¿Seguro que quieres salir?" si hay documentos procesados o extracción en curso |
 | **🔒 Anonimización** | Datos sensibles (tarjetas, contraseñas, direcciones) → `[PROTEGIDO]` |
 | **💾 Persistencia** | Los datos viajan directo a Supabase — listos para analítica o RAG |
-| **📤 Exportación** | CSV, JSON o **PDF profesional** con logo, QR de validación, tabla de auditoría y pie de página |
+| **📤 Exportación** | CSV, JSON o **PDF profesional** con logo personalizable, QR de validación, tabla de auditoría y pie de página |
+| **🏢 Marca blanca (White Label)** | Reporte PDF con nombre y logo de tu empresa — no el del desarrollador. Configurable desde ⚙ Config |
+| **⚙️ Configuración de empresa** | Modal para cargar logo (PNG/JPG) y nombre de empresa. Persiste en Supabase (`configuraciones_empresa`) |
 | **📋 Historial** | Todas las extracciones se acumulan en sesión |
 | **📝 Auditoría estructurada** | `auditoria.log` con timestamp, usuario (hostname), acción y estado; campo `log_detalles` en Supabase |
 | **🎨 Interfaz nativa** | App de escritorio Windows con dark mode, sin depender de un navegador |
@@ -113,15 +115,16 @@ Fotos de documentos, PDFs escaneados, capturas de pantalla... o texto plano. Sin
 
 ### Opción 1: Ejecutable portátil (recomendado)
 
+Solo necesitas hacer doble clic en `dist\DataExPY.exe`. También puedes usar `build_exe.bat` para regenerarlo.
+
 ```powershell
-# 1. Descarga DataExPY.exe de la última release
-# 2. Crea un archivo .env en la misma carpeta:
+# 1. Crea un archivo .env junto al .exe (misma carpeta):
 
 GROQ_API_KEY="gsk_tu_key_aqui"
 SUPABASE_URL="https://tu-proyecto.supabase.co"
 SUPABASE_KEY="sb_secret_tu_key_aqui"
 
-# 3. Ejecuta DataExPY.exe
+# 2. Haz doble clic en dist\DataExPY.exe
 ```
 
 ### Opción 2: Desde el código fuente
@@ -144,10 +147,12 @@ python main.py
 
 ### Opción 3: Construir tu propio .exe
 
+Haz doble clic en `build_exe.bat` o ejecútalo desde PowerShell:
+
 ```powershell
 pip install pyinstaller
-build_exe.bat
-# → El ejecutable estará en dist/DataExPY.exe
+.\build_exe.bat
+# → El ejecutable estará en dist\DataExPY.exe (doble clic para ejecutar)
 ```
 
 ---
@@ -166,7 +171,23 @@ build_exe.bat
 
 > **⚠️ Seguridad:** El archivo `.env` está en `.gitignore`. Nunca subas credenciales al repositorio.
 
-### Estructura de la tabla en Supabase
+### Tabla de configuración de empresa (White Label)
+
+Ejecuta `docs/migracion_config_empresa.sql` en el SQL Editor de Supabase para crear la tabla:
+
+```sql
+CREATE TABLE configuraciones_empresa (
+  id BIGSERIAL PRIMARY KEY,
+  empresa_nombre TEXT NOT NULL DEFAULT 'DataExPY',
+  logo_base64 TEXT,
+  color_primario TEXT DEFAULT '#0f3460',
+  actualizado_por TEXT,
+  actualizado_en TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_config_unica ON configuraciones_empresa ((true));
+```
+
+### Estructura de la tabla principal
 
 ```sql
 CREATE TABLE documentos_legales (
@@ -239,10 +260,11 @@ CREATE TABLE documentos_legales (
 6. **CSV** → datos estructurados
 7. **JSON** → datos + transcripción completa
 8. **PDF** → reporte de conformidad profesional con:
-   - Logo corporativo
+   - Logo de tu empresa (cargado desde ⚙ Config)
+   - Nombre de la empresa como título principal
    - QR de validación (hash SHA-256)
    - Tablas con datos agrupados (Identificación, Contables, Auditoría)
-   - Pie de página automático con fecha y numeración
+   - Pie de página "Powered by DataExPY" + fecha + numeración
 
 ---
 

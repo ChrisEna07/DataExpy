@@ -499,6 +499,59 @@ def procesar_con_transcripcion(file_bytes: bytes, mime_type: str) -> dict:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Configuración de empresa (White Label)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CONFIG_EMPRESA = {
+    "empresa_nombre": "DataExPY",
+    "logo_base64": None,
+    "color_primario": "#0f3460",
+}
+
+
+def _cargar_config_empresa() -> dict:
+    """Carga la configuración de empresa desde Supabase. Devuelve dict con valores por defecto si no existe."""
+    _init()
+    try:
+        resultado = _db_client.table("configuraciones_empresa").select("*").limit(1).execute()
+        if resultado.data:
+            row = resultado.data[0]
+            return {
+                "empresa_nombre": row.get("empresa_nombre", _DEFAULT_CONFIG_EMPRESA["empresa_nombre"]),
+                "logo_base64": row.get("logo_base64"),
+                "color_primario": row.get("color_primario", _DEFAULT_CONFIG_EMPRESA["color_primario"]),
+            }
+    except Exception as e:
+        log.warning("No se pudo cargar config_empresa: %s", e)
+    return dict(_DEFAULT_CONFIG_EMPRESA)
+
+
+def _guardar_config_empresa(config: dict) -> bool:
+    """Guarda/actualiza la configuración de empresa en Supabase. Solo una fila (singleton)."""
+    _init()
+    try:
+        # Ver si ya existe una fila
+        existente = _db_client.table("configuraciones_empresa").select("id").limit(1).execute()
+        payload = {
+            "empresa_nombre": config.get("empresa_nombre", _DEFAULT_CONFIG_EMPRESA["empresa_nombre"]),
+            "logo_base64": config.get("logo_base64"),
+            "color_primario": config.get("color_primario", _DEFAULT_CONFIG_EMPRESA["color_primario"]),
+            "actualizado_por": AUDIT_PROCESADO_POR,
+            "actualizado_en": datetime.now().isoformat(),
+        }
+        if existente.data:
+            row_id = existente.data[0]["id"]
+            _db_client.table("configuraciones_empresa").update(payload).eq("id", row_id).execute()
+        else:
+            _db_client.table("configuraciones_empresa").insert(payload).execute()
+        log.info("Configuración de empresa guardada: %s", payload["empresa_nombre"])
+        return True
+    except Exception as e:
+        log.error("Error al guardar config_empresa: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Reporte PDF de conformidad (versión profesional)
 # ---------------------------------------------------------------------------
 
@@ -517,22 +570,14 @@ def _get_logo_path() -> str | None:
     return None
 
 
-def _generar_logo_svg() -> str:
-    """Genera un logo vectorial simple (escudo) incrustado en el PDF."""
-    return None  # placeholder - usaremos shapes directos
-
-
-def _dibujar_logo(pdf, x: float, y: float, size: float = 12):
-    """Dibuja un escudo simple como logo directamente en el PDF."""
+def _dibujar_logo_defecto(pdf, x: float, y: float, size: float = 12):
+    """Dibuja un círculo con 'D' como logo por defecto."""
     pdf.set_fill_color(15, 40, 96)
     pdf.set_draw_color(15, 40, 96)
-    # Escudo
     cx, cy = x + size / 2, y + 2
     r = size / 2
-    # Círculo superior
     pdf.circle(cx, cy, r)
     pdf.set_fill_color(255, 255, 255)
-    # Letra D
     pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", int(size * 0.45))
     pdf.text(cx - size * 0.13, cy + size * 0.18, "D")
@@ -559,9 +604,31 @@ def _sanear_texto(texto: str) -> str:
     return texto
 
 
-def generar_reporte_pdf(datos: dict, output_path: str) -> str:
+def _cargar_logo_personalizado(config_empresa: dict | None, pdf, size_mm: float = 30):
+    """Insertar el logo de la empresa desde base64, o dibujar el logo por defecto."""
+    if not config_empresa:
+        _dibujar_logo_defecto(pdf, 160, 10, 12)
+        return
+    b64 = config_empresa.get("logo_base64")
+    if b64:
+        try:
+            from io import BytesIO
+            import base64
+            img_bytes = base64.b64decode(b64)
+            logo_tmp = BytesIO(img_bytes)
+            pdf.image(logo_tmp, x=160, y=10, w=size_mm)
+            return
+        except Exception as e:
+            log.warning("Logo personalizado inválido: %s", e)
+    _dibujar_logo_defecto(pdf, 160, 10, 12)
+
+
+def generar_reporte_pdf(datos: dict, output_path: str, config_empresa: dict = None) -> str:
     from fpdf import FPDF
     from pathlib import Path
+
+    if config_empresa is None:
+        config_empresa = _DEFAULT_CONFIG_EMPRESA
 
     FONT_DIR = Path(__file__).resolve().parent / "fonts"
     FONT_PATH = FONT_DIR / "arial.ttf"
@@ -581,31 +648,24 @@ def generar_reporte_pdf(datos: dict, output_path: str) -> str:
         return _sanear_texto(str(texto)) if FONT_NAME == "Helvetica" else str(texto)
 
     # -----------------------------------------------------------------------
-    # Header con logo y título
+    # Header: logo (esquina superior derecha) + nombre empresa + subtítulo
     # -----------------------------------------------------------------------
-    logo_path = _get_logo_path()
-    if logo_path:
-        pdf.image(logo_path, x=160, y=10, w=30)
-    else:
-        # Logo dibujado
-        pdf.set_fill_color(15, 40, 96)
-        pdf.set_draw_color(15, 40, 96)
-        cx, cy = 172, 18
-        pdf.circle(cx, cy, 10)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.text(cx - 3, cy + 3.5, "D")
+    _cargar_logo_personalizado(config_empresa, pdf)
 
-    pdf.set_font(FONT_NAME, "B", 18)
-    pdf.set_text_color(15, 40, 96)
-    pdf.cell(0, 10, w("DataExPY by ChrizDev"), new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font(FONT_NAME, "", 9)
+    # Color primario desde config
+    hex_color = config_empresa.get("color_primario", "#0f3460")
+    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
+
+    pdf.set_font(FONT_NAME, "B", 22)
+    pdf.set_text_color(r, g, b)
+    pdf.cell(0, 12, w(config_empresa.get("empresa_nombre", "DataExPY")), new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font(FONT_NAME, "", 10)
     pdf.set_text_color(100, 100, 100)
     pdf.cell(0, 5, w("Reporte de conformidad — Extraccion de documentos legales"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
     # Línea separadora
-    pdf.set_draw_color(15, 40, 96)
+    pdf.set_draw_color(r, g, b)
     pdf.set_line_width(0.6)
     pdf.line(10, pdf.get_y(), 200, pdf.get_y())
     pdf.ln(5)
@@ -628,8 +688,8 @@ def generar_reporte_pdf(datos: dict, output_path: str) -> str:
 
         # Fondo
         pdf.rect(x0, y, col1_w + col2_w, h, style="F")
-        # Borde izquierdo (azul)
-        pdf.set_fill_color(15, 40, 96)
+        # Borde izquierdo (color primario)
+        pdf.set_fill_color(r, g, b)
         pdf.rect(x0, y, 2, h, style="F")
 
         pdf.set_text_color(60, 60, 60)
@@ -641,7 +701,7 @@ def generar_reporte_pdf(datos: dict, output_path: str) -> str:
         pdf.cell(col1_w - 5, h - 2, label)
 
         pdf.set_font(FONT_NAME, "", 9)
-        pdf.set_text_color(15, 40, 96)
+        pdf.set_text_color(r, g, b)
         pdf.set_xy(x0 + col1_w + 3, y + 1.2)
         pdf.cell(col2_w - 3, h - 2, value)
 
@@ -726,7 +786,7 @@ def generar_reporte_pdf(datos: dict, output_path: str) -> str:
     pdf.set_y(-15)
     pdf.set_font(FONT_NAME, "", 7)
     pdf.set_text_color(140, 140, 140)
-    pdf.cell(0, 4, w(f"Generado: {datetime.now():%Y-%m-%d %H:%M}  |  Pagina {pdf.page_no()}/{{nb}}  |  DataExPY by ChrizDev"), align="C")
+    pdf.cell(0, 4, w(f"Generado: {datetime.now():%Y-%m-%d %H:%M}  |  Pagina {pdf.page_no()}/{{nb}}  |  Powered by DataExPY"), align="C")
 
     pdf.output(output_path)
     log.info("Reporte PDF generado: %s", output_path)

@@ -23,6 +23,8 @@ from extractor import (
     extraer_campos_dinamico,
     buscar_en_texto,
     generar_reporte_pdf,
+    _cargar_config_empresa,
+    _guardar_config_empresa,
     AUDIT_PROCESADO_POR,
     registrar_accion,
     Settings,
@@ -163,7 +165,7 @@ class CardFrame(ctk.CTkFrame):
 
 class HeaderFrame(ctk.CTkFrame):
     """Encabezado de la aplicación."""
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, on_config=None, **kwargs):
         super().__init__(master, fg_color=COLOR_ACCENT, corner_radius=0, height=70, **kwargs)
         self.pack(fill="x")
         self.pack_propagate(False)
@@ -185,6 +187,14 @@ class HeaderFrame(ctk.CTkFrame):
             container, text="Extracción inteligente de documentos legales",
             font=("Segoe UI", 11), text_color="#99aabb",
         ).pack(side="right")
+
+        if on_config:
+            ctk.CTkButton(
+                container, text="⚙ Config", width=70, height=32,
+                font=("Segoe UI", 12), fg_color="#1a5276", hover_color="#0f3460",
+                corner_radius=8,
+                command=on_config,
+            ).pack(side="right", padx=(8, 0))
 
 
 class StatusBar(ctk.CTkFrame):
@@ -420,6 +430,192 @@ class BusquedaModal(ctk.CTkToplevel):
 
 
 # ---------------------------------------------------------------------------
+# Modal de configuración de empresa (White Label)
+# ---------------------------------------------------------------------------
+
+class ConfigEmpresaModal(ctk.CTkToplevel):
+    def __init__(self, master, config_actual: dict, on_save=None):
+        super().__init__(master)
+        self.on_save = on_save
+        self.config = dict(config_actual)
+        self._logo_b64 = config_actual.get("logo_base64")
+        self._logo_preview = None
+
+        self.transient(master)
+        self.grab_set()
+        self.focus_set()
+
+        self.title("⚙ Configuración de empresa")
+        self.geometry("520x480")
+        self.minsize(480, 420)
+        self.after(100, lambda: self._centrar())
+        self._build_ui()
+
+    def _centrar(self):
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//3}")
+
+    def _build_ui(self):
+        pad = 20
+
+        ctk.CTkLabel(
+            self, text="Personalización del reporte PDF",
+            font=("Segoe UI", 16, "bold"), text_color=COLOR_TEXT,
+        ).pack(anchor="w", padx=pad, pady=(pad, 4))
+
+        ctk.CTkLabel(
+            self, text="Configura los datos de tu empresa para los reportes.",
+            font=("Segoe UI", 11), text_color=COLOR_LABEL,
+        ).pack(anchor="w", padx=pad, pady=(0, 14))
+
+        # --- Nombre de empresa ---
+        ctk.CTkLabel(
+            self, text="Nombre de la empresa",
+            font=("Segoe UI", 11), text_color=COLOR_LABEL,
+        ).pack(anchor="w", padx=pad)
+
+        self.entry_nombre = ctk.CTkEntry(
+            self,
+            font=("Segoe UI", 14), height=38,
+            fg_color=COLOR_CARD, text_color=COLOR_TEXT,
+            border_width=1, border_color="#334155",
+        )
+        self.entry_nombre.pack(fill="x", padx=pad, pady=(4, 14))
+        self.entry_nombre.insert(0, self.config.get("empresa_nombre", "DataExPY"))
+
+        # --- Logo de empresa ---
+        logo_frame = ctk.CTkFrame(self, fg_color="transparent")
+        logo_frame.pack(fill="x", padx=pad, pady=(0, 14))
+
+        ctk.CTkLabel(
+            logo_frame, text="Logo de la empresa",
+            font=("Segoe UI", 11), text_color=COLOR_LABEL,
+        ).pack(anchor="w")
+
+        logo_row = ctk.CTkFrame(logo_frame, fg_color="transparent")
+        logo_row.pack(fill="x", pady=(4, 0))
+
+        # Preview del logo
+        self.preview_label = ctk.CTkLabel(
+            logo_row, text="", width=80, height=80,
+            fg_color=COLOR_CARD, corner_radius=8,
+        )
+        self.preview_label.pack(side="left", padx=(0, 12))
+
+        # Si ya hay logo base64, mostrar preview
+        self._actualizar_preview()
+
+        btn_col = ctk.CTkFrame(logo_row, fg_color="transparent")
+        btn_col.pack(side="left", fill="y")
+
+        ctk.CTkButton(
+            btn_col, text="Seleccionar logo...", command=self._seleccionar_logo,
+            fg_color=COLOR_ACCENT, hover_color="#1a5276",
+            font=("Segoe UI", 12), height=34,
+        ).pack(anchor="w", pady=(0, 4))
+
+        self._logo_status = ctk.CTkLabel(
+            btn_col, text="",
+            font=("Segoe UI", 10), text_color=COLOR_LABEL,
+        )
+        self._logo_status.pack(anchor="w")
+
+        # --- Botones ---
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=pad, pady=(pad, pad), side="bottom")
+
+        ctk.CTkButton(
+            btn_frame, text="Cancelar", command=self.destroy,
+            fg_color="#444", hover_color="#555",
+            font=("Segoe UI", 12), height=36, width=100,
+        ).pack(side="right", padx=(8, 0))
+
+        self.btn_guardar = ctk.CTkButton(
+            btn_frame, text="💾 Guardar configuración", command=self._guardar,
+            fg_color="#22c55e", hover_color="#16a34a",
+            font=("Segoe UI", 12, "bold"), height=36,
+        )
+        self.btn_guardar.pack(side="right")
+
+    def _actualizar_preview(self):
+        if not self._logo_b64:
+            self.preview_label.configure(image="", text="Sin logo")
+            return
+        try:
+            import base64
+            from io import BytesIO
+            img_bytes = base64.b64decode(self._logo_b64)
+            pil_img = Image.open(BytesIO(img_bytes))
+            pil_img.thumbnail((80, 80), Image.LANCZOS)
+
+            from PIL import ImageTk
+            tk_img = ImageTk.PhotoImage(pil_img)
+            self._logo_preview = tk_img
+            self.preview_label.configure(image=tk_img, text="")
+        except Exception:
+            self.preview_label.configure(image="", text="Logo inválido")
+
+    def _seleccionar_logo(self):
+        path = filedialog.askopenfilename(
+            title="Seleccionar logo de empresa",
+            filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.gif *.bmp")],
+        )
+        if not path:
+            return
+        try:
+            from PIL import Image
+            import base64
+            from io import BytesIO
+
+            with open(path, "rb") as f:
+                img_bytes = f.read()
+
+            # Limitar tamaño máximo (2 MB)
+            if len(img_bytes) > 2 * 1024 * 1024:
+                messagebox.showwarning("Logo muy grande", "El logo debe pesar menos de 2 MB.")
+                return
+
+            self._logo_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            self._actualizar_preview()
+            self._logo_status.configure(text=f"Logo cargado ({len(img_bytes)//1024} KB)")
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo cargar el logo:\n{e}")
+
+    def _guardar(self):
+        nombre = self.entry_nombre.get().strip()
+        if not nombre:
+            messagebox.showwarning("Nombre requerido", "Ingresa el nombre de la empresa.")
+            return
+
+        config = {
+            "empresa_nombre": nombre,
+            "logo_base64": self._logo_b64,
+            "color_primario": "#0f3460",
+        }
+
+        self.btn_guardar.configure(state="disabled", text="Guardando...")
+        self.update_idletasks()
+
+        try:
+            ok = _guardar_config_empresa(config)
+            if ok:
+                if self.on_save:
+                    self.on_save(config)
+                messagebox.showinfo("Guardado", "Configuración de empresa guardada con éxito.")
+                self.destroy()
+            else:
+                messagebox.showerror("Error", "No se pudo guardar la configuración en Supabase.")
+                self.btn_guardar.configure(state="normal", text="💾 Guardar configuración")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al guardar:\n{e}")
+            self.btn_guardar.configure(state="normal", text="💾 Guardar configuración")
+
+
+# ---------------------------------------------------------------------------
 # Ventana principal
 # ---------------------------------------------------------------------------
 
@@ -445,6 +641,7 @@ class DataExPYApp(ctk.CTk):
         self.after(100, self._check_queue)
 
         self._validar_conf()
+        self.config_empresa = _cargar_config_empresa()
         self._build_ui()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -473,7 +670,7 @@ class DataExPYApp(ctk.CTk):
 
     def _build_ui(self):
         # Header
-        HeaderFrame(self)
+        HeaderFrame(self, on_config=self._abrir_config_empresa)
 
         # Cuerpo principal
         body = ctk.CTkFrame(self, fg_color=COLOR_BG)
@@ -749,15 +946,22 @@ class DataExPYApp(ctk.CTk):
 
                 if tipo == "progreso":
                     self.progress_bar.set(msg["valor"])
+                    if "badge" in msg:
+                        self.status_badge.configure(text=msg["badge"]["texto"], text_color=msg["badge"]["color"])
                 elif tipo == "resultado":
                     self.ultimo_resultado = msg.get("datos")
                     self.transcripcion_actual = msg.get("texto", "")
                     if self.ultimo_resultado:
                         self.ultimo_resultado["_timestamp"] = datetime.now().strftime("%H:%M:%S")
                         self.historial.append(self.ultimo_resultado)
+                    # Barra llena + badge verde inmediato
+                    self.progress_bar.set(1.0)
+                    self.status_badge.configure(text="🟢 Procesado", text_color="#22c55e")
                     self._mostrar_resultado(self.ultimo_resultado or {})
                     self.status_bar.set(msg.get("status_msg", "Listo"))
                     self._mostrar_toast(msg.get("toast_msg", "Completado"), "success")
+                    # Reset barra tras 2s
+                    self.after(2000, lambda: self.progress_bar.set(0))
                 elif tipo == "error":
                     self.status_bar.set(msg.get("status_msg", "Error"), False)
                     self._mostrar_toast(msg.get("toast_msg", "Error"), "error")
@@ -770,10 +974,21 @@ class DataExPYApp(ctk.CTk):
 
     def _procesar(self, texto: str):
         try:
-            self.task_queue.put({"tipo": "progreso", "valor": 0.4})
+            self.task_queue.put({
+                "tipo": "progreso", "valor": 0.4,
+                "badge": {"texto": "🟡 Procesando...", "color": "#eab308"},
+            })
             datos = extraer(texto)
-            self.task_queue.put({"tipo": "progreso", "valor": 0.7})
+            self.task_queue.put({
+                "tipo": "progreso", "valor": 0.7,
+                "badge": {"texto": "🟡 Guardando...", "color": "#eab308"},
+            })
             guardar(datos)
+
+            # Barra llena + pausa para que el usuario vea el 100%
+            import time
+            self.task_queue.put({"tipo": "progreso", "valor": 1.0})
+            time.sleep(0.3)
 
             self.task_queue.put({
                 "tipo": "resultado",
@@ -794,14 +1009,25 @@ class DataExPYApp(ctk.CTk):
 
     def _procesar_imagen(self):
         try:
-            self.task_queue.put({"tipo": "progreso", "valor": 0.4})
+            self.task_queue.put({
+                "tipo": "progreso", "valor": 0.4,
+                "badge": {"texto": "🟡 Analizando imagen...", "color": "#eab308"},
+            })
             datos = procesar_con_transcripcion(self.imagen_bytes, self.imagen_mime)
-            self.task_queue.put({"tipo": "progreso", "valor": 0.8})
+            self.task_queue.put({
+                "tipo": "progreso", "valor": 0.8,
+                "badge": {"texto": "🟡 Extrayendo datos...", "color": "#eab308"},
+            })
 
             resultado = {
                 k: v for k, v in datos.items() if k != "transcripcion_completa"
             }
             transcripcion = datos.get("transcripcion_completa", "")
+
+            # Barra llena + pausa para que el usuario vea el 100%
+            import time
+            self.task_queue.put({"tipo": "progreso", "valor": 1.0})
+            time.sleep(0.3)
 
             self.task_queue.put({
                 "tipo": "resultado",
@@ -946,7 +1172,7 @@ class DataExPYApp(ctk.CTk):
             datos = dict(self.ultimo_resultado)
             if self.transcripcion_actual:
                 datos["transcripcion_completa"] = self.transcripcion_actual
-            generar_reporte_pdf(datos, path)
+            generar_reporte_pdf(datos, path, config_empresa=self.config_empresa)
             self.status_bar.set(f"Reporte PDF generado: {Path(path).name}")
             registrar_accion("GENERAR_PDF", estado="EXITO", archivo=Path(path).name)
         except Exception as e:
@@ -1015,6 +1241,15 @@ class DataExPYApp(ctk.CTk):
         registrar_accion("CERRAR_APLICACION", estado="EXITO")
         self.destroy()
         sys.exit(0)
+
+    def _abrir_config_empresa(self):
+        """Abre el modal de configuración de empresa (White Label)."""
+        def _on_save(config):
+            self.config_empresa = config
+            self.status_bar.set(f"Configuración actualizada: {config.get('empresa_nombre')}")
+            registrar_accion("CONFIGURAR_EMPRESA", estado="EXITO", empresa=config.get("empresa_nombre"))
+
+        ConfigEmpresaModal(self, config_actual=self.config_empresa, on_save=_on_save)
 
 
 # ---------------------------------------------------------------------------
